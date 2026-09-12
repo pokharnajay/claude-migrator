@@ -11,8 +11,8 @@ os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 
 from PySide6.QtWidgets import QApplication  # noqa: E402
 
-from claude_migrator import app as app_module  # noqa: E402
-from claude_migrator.app import STEP_BACKUP, STEP_BLOCKED, STEP_SYNC, MigratorWindow  # noqa: E402
+from claude_migrator import ui as app_module  # noqa: E402
+from claude_migrator.ui import STEP_BACKUP, STEP_BLOCKED, STEP_SYNC, MigratorWindow  # noqa: E402
 
 
 @pytest.fixture(scope="session")

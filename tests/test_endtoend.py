@@ -61,6 +61,6 @@ def test_second_run_changes_nothing(storage_root: Path) -> None:
 
 
 def test_claude_running_check_returns_a_bool() -> None:
-    from claude_migrator.app import claude_is_running
+    from claude_migrator.ui import claude_is_running
 
     assert isinstance(claude_is_running(), bool)
