@@ -19,8 +19,8 @@ from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
 
-from PySide6.QtCore import QObject, Qt, QThread, Signal
-from PySide6.QtGui import QFont, QPalette
+from PySide6.QtCore import QObject, QRectF, Qt, QThread, QTimer, Signal
+from PySide6.QtGui import QColor, QFont, QPainter, QPalette, QPen
 from PySide6.QtWidgets import (
     QApplication,
     QCheckBox,
@@ -43,6 +43,10 @@ from .safety import SafetyError
 from .storage import Account, Org
 
 STEP_BLOCKED, STEP_BACKUP, STEP_SYNC, STEP_DONE = range(4)
+
+# How long the scan spinner stays up even when the work finishes sooner. Below
+# roughly this, a rescan reads as a button that did nothing at all.
+SCAN_MINIMUM_SECONDS = 2.0
 
 ACCENT = "#c96442"
 
@@ -107,6 +111,52 @@ class Worker(QObject):
 
 
 # --------------------------------------------------------------------------- widgets
+
+
+class Spinner(QWidget):
+    """A small indeterminate progress indicator.
+
+    Qt ships no spinner widget, and a progress bar is the wrong shape for a
+    table row, so this paints a rotating arc.
+    """
+
+    def __init__(self, diameter: int = 14, parent: QWidget | None = None) -> None:
+        super().__init__(parent)
+        self._diameter = diameter
+        self._angle = 0
+        self.setFixedSize(diameter + 2, diameter + 2)
+        self._timer = QTimer(self)
+        self._timer.setInterval(1000 // 30)
+        self._timer.timeout.connect(self._advance)
+
+    def start(self) -> None:
+        if not self._timer.isActive():
+            self._timer.start()
+        self.show()
+
+    def stop(self) -> None:
+        self._timer.stop()
+        self.hide()
+
+    def _advance(self) -> None:
+        self._angle = (self._angle + 12) % 360
+        self.update()
+
+    def paintEvent(self, event) -> None:  # noqa: N802  (Qt naming)
+        painter = QPainter(self)
+        painter.setRenderHint(QPainter.Antialiasing)
+        painter.setBrush(Qt.NoBrush)
+
+        track = QColor(ACCENT)
+        track.setAlpha(55)
+        inset = 1.0
+        box = QRectF(inset, inset, self._diameter, self._diameter)
+
+        painter.setPen(QPen(track, 2.0, Qt.SolidLine, Qt.RoundCap))
+        painter.drawArc(box, 0, 360 * 16)
+
+        painter.setPen(QPen(QColor(ACCENT), 2.0, Qt.SolidLine, Qt.RoundCap))
+        painter.drawArc(box, -self._angle * 16, 100 * 16)
 
 
 class Card(QFrame):
@@ -177,9 +227,22 @@ class AccountRow(QWidget):
 
         row.addStretch(1)
 
-        detail = QLabel(describe_workspace(org))
-        detail.setObjectName("muted")
-        row.addWidget(detail)
+        self.spinner = Spinner()
+        self.spinner.hide()
+        row.addWidget(self.spinner)
+
+        self.detail = QLabel(describe_workspace(org))
+        self.detail.setObjectName("muted")
+        row.addWidget(self.detail)
+
+    def set_loading(self, loading: bool) -> None:
+        """Swap the session counts for a spinner while they are being recounted."""
+        if loading:
+            self.detail.setText("scanning…")
+            self.spinner.start()
+        else:
+            self.detail.setText(describe_workspace(self.org))
+            self.spinner.stop()
 
     @property
     def selected(self) -> bool:
@@ -211,6 +274,9 @@ class MigratorWindow(QWidget):
         self._thread: QThread | None = None
         self._worker: Worker | None = None
         self._next_step = STEP_BACKUP
+        self._on_done: object | None = None
+        self._result = None
+        self._post_scan_note: str | None = None
 
         self.setWindowTitle("Claude Migrator")
         self.setMinimumSize(800, 720)
@@ -273,6 +339,19 @@ class MigratorWindow(QWidget):
         self.sources_box = QVBoxLayout()
         self.sources_box.setSpacing(0)
         accounts.body.addLayout(self.sources_box)
+
+        self.scanning_row = QWidget()
+        scanning_layout = QHBoxLayout(self.scanning_row)
+        scanning_layout.setContentsMargins(0, 3, 0, 3)
+        scanning_layout.setSpacing(10)
+        self.scanning_spinner = Spinner()
+        scanning_layout.addWidget(self.scanning_spinner)
+        scanning_label = QLabel("Scanning this Mac…")
+        scanning_label.setObjectName("muted")
+        scanning_layout.addWidget(scanning_label)
+        scanning_layout.addStretch(1)
+        self.scanning_row.hide()
+        accounts.body.addWidget(self.scanning_row)
         root.addWidget(accounts)
 
         backup_card = Card("Backup")
@@ -327,6 +406,7 @@ class MigratorWindow(QWidget):
         buttons.addStretch(1)
 
         self.rescan_button = QPushButton("Rescan")
+        self.rescan_button.setToolTip("Recount sessions for every account on this Mac")
         self.rescan_button.clicked.connect(self.do_scan)
         buttons.addWidget(self.rescan_button)
 
@@ -417,6 +497,40 @@ class MigratorWindow(QWidget):
     # -- scan --------------------------------------------------------------
 
     def do_scan(self) -> None:
+        """Recount everything, off the GUI thread so the spinner can turn."""
+        if self._busy():
+            return
+
+        for row in self.source_rows + self.target_rows:
+            row.set_loading(True)
+        if not (self.source_rows or self.target_rows):
+            self.scanning_row.show()
+            self.scanning_spinner.start()
+
+        app_support, cli_home = self.app_support, self.cli_home
+        started = time.monotonic()
+
+        def job(progress, log):
+            data = (
+                storage.current_account_uuid(app_support),
+                storage.discover_accounts(app_support),
+                identity.resolve_identities(app_support, cli_home),
+            )
+            # A scan that finishes instantly looks like a button that did
+            # nothing, so let the spinner be seen.
+            remaining = SCAN_MINIMUM_SECONDS - (time.monotonic() - started)
+            if remaining > 0:
+                time.sleep(remaining)
+            self._result = data
+            return "Scan complete"
+
+        self._start(job, "Scanning…", self.step, on_done=self._apply_scan)
+
+    def _apply_scan(self, data) -> None:
+        current, accounts, people = data
+
+        self.scanning_spinner.stop()
+        self.scanning_row.hide()
         self.log.clear()
         self.scan = None
         self.backup_path = None
@@ -427,10 +541,6 @@ class MigratorWindow(QWidget):
         self.source_rows.clear()
         self.target_rows.clear()
         self.sources_label.setText("Restore history from")
-
-        current = storage.current_account_uuid(self.app_support)
-        accounts = storage.discover_accounts(self.app_support)
-        people = identity.resolve_identities(self.app_support, self.cli_home)
 
         if not accounts:
             self._halt("No Claude storage found on this Mac.")
@@ -499,6 +609,11 @@ class MigratorWindow(QWidget):
         else:
             total = sum(org.total_sessions for _, org, _ in sources)
             self.say(f"{total} session(s) available to restore.")
+
+        note, self._post_scan_note = self._post_scan_note, None
+        if note:
+            self.say()
+            self.say(note)
 
         self._refresh_backup_label()
         self._check_claude_running()
@@ -744,7 +859,8 @@ class MigratorWindow(QWidget):
 
     # -- threading ---------------------------------------------------------
 
-    def _start(self, job, status: str, next_step: int) -> None:
+    def _start(self, job, status: str, next_step: int, on_done=None) -> None:
+        self._on_done = on_done
         self._set_controls_enabled(False)
         self.status.setText(status)
         self.progress.setRange(0, 0)
@@ -797,6 +913,15 @@ class MigratorWindow(QWidget):
 
     def _on_finished(self, ok: bool, message: str) -> None:
         next_step = self._next_step
+        handler, self._on_done = self._on_done, None
+        if ok and handler is not None:
+            # Widgets can only be built here, on the GUI thread.
+            handler(self._result)
+            self.status.setText(message)
+            self._set_controls_enabled(True)
+            self.progress.hide()
+            return
+
         self.progress.hide()
         self._set_controls_enabled(True)
 
@@ -846,14 +971,26 @@ class MigratorWindow(QWidget):
         )
         for _ in range(20):
             if not claude_is_running():
-                # Rescan first: it clears the log, so anything said before it
-                # would be wiped straight away.
+                # The scan clears the log when it lands, so the note has to be
+                # handed to it rather than printed now.
+                self._post_scan_note = "Claude has quit. Ready to go."
                 self.do_scan()
-                self.say()
-                self.say("Claude has quit. Ready to go.")
                 return
             time.sleep(0.25)
         self.say("Claude is still running — quit it from its own window, then press Rescan.")
+
+    def closeEvent(self, event) -> None:  # noqa: N802  (Qt naming)
+        """Let a running job finish before the window and its thread go away.
+
+        Closing mid-job would otherwise destroy a QThread that is still
+        running, which aborts the process rather than quitting it.
+        """
+        thread = self._thread
+        if thread is not None and thread.isRunning():
+            self.status.setText("Finishing up…")
+            thread.quit()
+            thread.wait(10_000)
+        super().closeEvent(event)
 
     def _reveal(self) -> None:
         if self.backup_path:

@@ -80,9 +80,11 @@ def test_the_whole_flow_through_the_window(storage_root, cli_root, tmp_path, mon
 
     qt_app = QApplication.instance() or QApplication([])
     monkeypatch.setattr(ui_module, "claude_is_running", lambda: False)
+    monkeypatch.setattr(ui_module, "SCAN_MINIMUM_SECONDS", 0.0)
     monkeypatch.setattr(backup_module, "DOWNLOADS", tmp_path / "Downloads")
 
     window = ui_module.MigratorWindow(storage_root, cli_root)
+    assert pump(qt_app, lambda: window._thread is None, 15), "the opening scan never finished"
     assert window.step == ui_module.STEP_BACKUP
 
     window._run_backup()

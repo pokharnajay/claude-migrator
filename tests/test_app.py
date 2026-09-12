@@ -23,9 +23,16 @@ def qt_app():
 @pytest.fixture
 def window(qt_app, storage_root: Path, cli_root: Path, monkeypatch):
     monkeypatch.setattr(app_module, "claude_is_running", lambda: False)
+    monkeypatch.setattr(app_module, "SCAN_MINIMUM_SECONDS", 0.0)
     win = MigratorWindow(storage_root, cli_root)
+    settle(qt_app, win)
     yield win
     win.deleteLater()
+
+
+def settle(qt_app, win, seconds: float = 15.0) -> None:
+    """Let an in-flight scan (or any job) finish before asserting on the window."""
+    assert pump(qt_app, lambda: win._thread is None, seconds), "a background job never finished"
 
 
 def test_the_signed_in_account_is_named_not_numbered(window) -> None:
@@ -54,7 +61,9 @@ def test_backup_is_the_first_available_step(window) -> None:
 
 def test_everything_is_blocked_while_claude_runs(qt_app, storage_root, cli_root, monkeypatch) -> None:
     monkeypatch.setattr(app_module, "claude_is_running", lambda: True)
+    monkeypatch.setattr(app_module, "SCAN_MINIMUM_SECONDS", 0.0)
     win = MigratorWindow(storage_root, cli_root)
+    settle(qt_app, win)
     assert win.step == STEP_BLOCKED
     assert not win.action_button.isEnabled()
     assert not win.export_button.isEnabled()
@@ -96,6 +105,7 @@ def test_a_machine_with_no_other_account_still_offers_import(
 ) -> None:
     """Import is the whole point on a fresh Mac — it must not need a local source."""
     monkeypatch.setattr(app_module, "claude_is_running", lambda: False)
+    monkeypatch.setattr(app_module, "SCAN_MINIMUM_SECONDS", 0.0)
     import json
 
     from tests.conftest import NEW, NEW_ORG
@@ -107,6 +117,7 @@ def test_a_machine_with_no_other_account_still_offers_import(
     cli.mkdir()
 
     win = MigratorWindow(app_support, cli)
+    settle(qt_app, win)
     assert win.source_rows == []
     assert win.import_button.isEnabled()
     assert not win.export_button.isEnabled()
@@ -188,9 +199,10 @@ def test_progress_updates_reach_the_bar(qt_app, window) -> None:
     assert window.progress.maximum() == 3
 
 
-def test_rescanning_shows_that_it_ran(window) -> None:
+def test_rescanning_shows_that_it_ran(qt_app, window) -> None:
     """Repeated scans look identical otherwise, which reads as nothing happening."""
     window.do_scan()
+    settle(qt_app, window)
     assert "Scanned at" in window.log.toPlainText()
 
 
@@ -256,10 +268,12 @@ def test_an_empty_workspace_says_so_rather_than_showing_zeroes() -> None:
     assert describe_workspace(empty) == "no sessions"
 
 
-def test_rescan_refreshes_the_signed_in_rows_without_duplicating_them(window) -> None:
+def test_rescan_refreshes_the_signed_in_rows_without_duplicating_them(qt_app, window) -> None:
     before = len(window.target_rows)
     window.do_scan()
+    settle(qt_app, window)
     window.do_scan()
+    settle(qt_app, window)
     assert len(window.target_rows) == before
 
 
@@ -269,7 +283,9 @@ def test_rescan_refreshes_the_signed_in_rows_without_duplicating_them(window) ->
 def test_disabled_buttons_keep_a_background_and_border(qt_app, storage_root, cli_root, monkeypatch) -> None:
     """A disabled button with a transparent background reads as plain text."""
     monkeypatch.setattr(app_module, "claude_is_running", lambda: True)
+    monkeypatch.setattr(app_module, "SCAN_MINIMUM_SECONDS", 0.0)
     win = MigratorWindow(storage_root, cli_root)
+    settle(qt_app, win)
     style = win.styleSheet()
     disabled = style[style.index("QPushButton:disabled"):]
     block = disabled[: disabled.index("}")]
@@ -288,7 +304,9 @@ def test_a_disabled_button_is_visibly_recessed(qt_app, storage_root, cli_root, m
     clicking it did nothing and said nothing.
     """
     monkeypatch.setattr(app_module, "claude_is_running", lambda: True)
+    monkeypatch.setattr(app_module, "SCAN_MINIMUM_SECONDS", 0.0)
     win = MigratorWindow(storage_root, cli_root)
+    settle(qt_app, win)
     style = win.styleSheet()
 
     def block(selector: str) -> str:
@@ -303,7 +321,9 @@ def test_a_disabled_button_is_visibly_recessed(qt_app, storage_root, cli_root, m
 
 def test_the_banner_offers_a_way_out(qt_app, storage_root, cli_root, monkeypatch) -> None:
     monkeypatch.setattr(app_module, "claude_is_running", lambda: True)
+    monkeypatch.setattr(app_module, "SCAN_MINIMUM_SECONDS", 0.0)
     win = MigratorWindow(storage_root, cli_root)
+    settle(qt_app, win)
     assert not win.banner_box.isHidden()
     assert win.quit_claude_button.isEnabled(), "the only enabled control must be the way out"
     win.deleteLater()
@@ -312,7 +332,9 @@ def test_the_banner_offers_a_way_out(qt_app, storage_root, cli_root, monkeypatch
 def test_quitting_claude_rescans_and_unblocks(qt_app, storage_root, cli_root, monkeypatch) -> None:
     state = {"running": True}
     monkeypatch.setattr(app_module, "claude_is_running", lambda: state["running"])
+    monkeypatch.setattr(app_module, "SCAN_MINIMUM_SECONDS", 0.0)
     win = MigratorWindow(storage_root, cli_root)
+    settle(qt_app, win)
     assert win.step == STEP_BLOCKED
 
     def quit_it(*args, **kwargs):
@@ -326,6 +348,7 @@ def test_quitting_claude_rescans_and_unblocks(qt_app, storage_root, cli_root, mo
 
     monkeypatch.setattr(app_module.subprocess, "run", quit_it)
     win._quit_claude()
+    settle(qt_app, win)
 
     assert win.step == STEP_BACKUP
     assert win.banner_box.isHidden()
@@ -343,3 +366,73 @@ def test_export_runs_when_nothing_blocks_it(qt_app, window, tmp_path, monkeypatc
     assert pump(qt_app, lambda: window._thread is None, 30)
     assert window.status.text() == "Bundle exported", window.log.toPlainText()
     assert list((tmp_path / "Downloads").glob("*.zip"))
+
+
+# ------------------------------------------------------------------ scanning
+
+
+def test_scanning_happens_off_the_gui_thread(qt_app, window) -> None:
+    """Otherwise the spinner cannot turn and the window freezes while it runs."""
+    window.do_scan()
+    assert window._thread is not None, "the scan ran on the GUI thread"
+    settle(qt_app, window)
+
+
+def test_rows_show_a_spinner_while_being_recounted(qt_app, window) -> None:
+    window.do_scan()
+    row = (window.source_rows + window.target_rows)[0]
+    assert row.detail.text() == "scanning…"
+    assert not row.spinner.isHidden()
+    settle(qt_app, window)
+
+
+def test_the_spinner_stops_and_the_counts_come_back(qt_app, window) -> None:
+    window.do_scan()
+    settle(qt_app, window)
+    row = (window.source_rows + window.target_rows)[0]
+    assert row.spinner.isHidden()
+    assert "code" in row.detail.text()
+
+
+def test_a_first_run_shows_a_placeholder_while_it_looks(qt_app, storage_root, cli_root, monkeypatch) -> None:
+    """On launch there are no rows yet, so the spinner needs somewhere to live."""
+    monkeypatch.setattr(app_module, "claude_is_running", lambda: False)
+    monkeypatch.setattr(app_module, "SCAN_MINIMUM_SECONDS", 0.0)
+    win = MigratorWindow(storage_root, cli_root)
+    assert not win.scanning_row.isHidden()
+    settle(qt_app, win)
+    assert win.scanning_row.isHidden()
+    win.deleteLater()
+
+
+def test_a_second_scan_is_ignored_while_one_is_running(qt_app, window) -> None:
+    window.do_scan()
+    first = window._thread
+    window.do_scan()
+    assert window._thread is first, "a concurrent scan was started"
+    settle(qt_app, window)
+
+
+def test_the_spinner_animates(qt_app) -> None:
+    from claude_migrator.ui import Spinner
+
+    spinner = Spinner()
+    spinner.start()
+    before = spinner._angle
+    for _ in range(3):
+        spinner._advance()
+    assert spinner._angle != before
+    spinner.stop()
+    assert not spinner._timer.isActive()
+
+
+def test_closing_mid_scan_does_not_destroy_a_running_thread(qt_app, storage_root, cli_root, monkeypatch) -> None:
+    from PySide6.QtGui import QCloseEvent
+
+    monkeypatch.setattr(app_module, "claude_is_running", lambda: False)
+    monkeypatch.setattr(app_module, "SCAN_MINIMUM_SECONDS", 0.0)
+    win = MigratorWindow(storage_root, cli_root)
+    assert win._thread is not None
+    win.closeEvent(QCloseEvent())
+    assert win._thread is None or not win._thread.isRunning()
+    win.deleteLater()
