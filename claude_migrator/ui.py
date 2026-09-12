@@ -14,6 +14,7 @@ Claude.
 from __future__ import annotations
 
 import subprocess
+import time
 from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
@@ -236,11 +237,20 @@ class MigratorWindow(QWidget):
         subtitle.setWordWrap(True)
         root.addWidget(subtitle)
 
+        self.banner_box = QWidget()
+        self.banner_box.setObjectName("banner")
+        banner_row = QHBoxLayout(self.banner_box)
+        banner_row.setContentsMargins(14, 10, 12, 10)
+        banner_row.setSpacing(12)
         self.banner = QLabel()
-        self.banner.setObjectName("banner")
+        self.banner.setObjectName("bannerText")
         self.banner.setWordWrap(True)
-        self.banner.hide()
-        root.addWidget(self.banner)
+        banner_row.addWidget(self.banner, 1)
+        self.quit_claude_button = QPushButton("Quit Claude")
+        self.quit_claude_button.clicked.connect(self._quit_claude)
+        banner_row.addWidget(self.quit_claude_button)
+        self.banner_box.hide()
+        root.addWidget(self.banner_box)
 
         accounts = Card("Accounts")
         self.target_label = QLabel()
@@ -342,8 +352,11 @@ class MigratorWindow(QWidget):
         # as a line of plain text rather than a control that is switched off.
         button_bg = "#2c2c2f" if dark else "#ffffff"
         button_border = "#48484d" if dark else "#c8c6c2"
-        button_off_bg = "#1f1f21" if dark else "#f2f1ef"
-        button_off_border = "#38383c" if dark else "#dcdad6"
+        # A disabled button has to be unmistakably recessed. Made too close to
+        # the enabled fill, it invites a click that does nothing at all.
+        button_off_bg = "#191919" if dark else "#f4f3f1"
+        button_off_border = "#2a2a2d" if dark else "#e4e2de"
+        button_off_text = "#5c5a58" if dark else "#b0ada9"
 
         self.setStyleSheet(f"""
             QWidget {{
@@ -360,10 +373,11 @@ class MigratorWindow(QWidget):
             }}
             #divider {{ background: {border}; border: none; }}
             #banner {{
-                background: rgba(201,100,66,0.12); color: {ACCENT};
+                background: rgba(201,100,66,0.12);
                 border: 1px solid rgba(201,100,66,0.35);
-                border-radius: 8px; padding: 9px 12px;
+                border-radius: 8px;
             }}
+            #bannerText {{ color: {ACCENT}; }}
             #log {{
                 background: {log_bg}; border: 1px solid {border};
                 border-radius: 10px; padding: 10px; color: {muted};
@@ -382,16 +396,13 @@ class MigratorWindow(QWidget):
                 color: white; font-weight: 600; padding: 7px 22px;
             }}
             QPushButton#primary:hover {{ background: #b5573a; border-color: #b5573a; }}
-            QPushButton:disabled {{
-                color: {muted};
+            QPushButton:disabled, QPushButton#primary:disabled {{
+                color: {button_off_text};
                 background: {button_off_bg};
                 border: 1px solid {button_off_border};
+                font-weight: 400;
             }}
-            QPushButton#primary:disabled {{
-                background: {button_off_bg};
-                border: 1px solid {button_off_border};
-                color: {muted};
-            }}
+            QPushButton:disabled:hover {{ border-color: {button_off_border}; }}
             QProgressBar {{ background: {border}; border: none; border-radius: 2px; }}
             QProgressBar::chunk {{ background: {ACCENT}; border-radius: 2px; }}
         """)
@@ -497,13 +508,14 @@ class MigratorWindow(QWidget):
         running = claude_is_running()
         if running:
             self.banner.setText(
-                "<b>Quit Claude before continuing.</b> It has these session files open, "
-                "and it rewrites its own index while running. Quit it, then press Rescan."
+                "<b>Quit Claude to continue.</b> Every button below is disabled while it "
+                "is running — it holds these session files open and rewrites its own "
+                "index as it goes."
             )
-            self.banner.show()
+            self.banner_box.show()
             self._set_step(STEP_BLOCKED)
         else:
-            self.banner.hide()
+            self.banner_box.hide()
             self._set_step(STEP_BACKUP if self.scan else STEP_BLOCKED)
         return running
 
@@ -819,6 +831,29 @@ class MigratorWindow(QWidget):
         blocked = step == STEP_BLOCKED
         self.export_button.setEnabled(has_sources and not blocked and not self._busy())
         self.import_button.setEnabled(self.scan is not None and not blocked and not self._busy())
+
+    def _quit_claude(self) -> None:
+        """Ask Claude to quit, the same as Cmd-Q, then rescan.
+
+        A graceful quit request, never a kill: anything Claude has in flight
+        gets to finish and save.
+        """
+        self.say("Asking Claude to quit…")
+        subprocess.run(
+            ["osascript", "-e", 'tell application "Claude" to quit'],
+            capture_output=True,
+            text=True,
+        )
+        for _ in range(20):
+            if not claude_is_running():
+                # Rescan first: it clears the log, so anything said before it
+                # would be wiped straight away.
+                self.do_scan()
+                self.say()
+                self.say("Claude has quit. Ready to go.")
+                return
+            time.sleep(0.25)
+        self.say("Claude is still running — quit it from its own window, then press Rescan.")
 
     def _reveal(self) -> None:
         if self.backup_path:

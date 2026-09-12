@@ -43,7 +43,7 @@ def test_empty_workspaces_are_not_listed(window) -> None:
 
 
 def test_no_warning_banner_when_claude_is_closed(window) -> None:
-    assert window.banner.isHidden()
+    assert window.banner_box.isHidden()
 
 
 def test_backup_is_the_first_available_step(window) -> None:
@@ -59,7 +59,7 @@ def test_everything_is_blocked_while_claude_runs(qt_app, storage_root, cli_root,
     assert not win.action_button.isEnabled()
     assert not win.export_button.isEnabled()
     assert not win.import_button.isEnabled()
-    assert not win.banner.isHidden()
+    assert not win.banner_box.isHidden()
     win.deleteLater()
 
 
@@ -276,3 +276,70 @@ def test_disabled_buttons_keep_a_background_and_border(qt_app, storage_root, cli
     assert "background: transparent" not in block
     assert "border:" in block
     win.deleteLater()
+
+
+# ------------------------------------------------------- the blocked state
+
+
+def test_a_disabled_button_is_visibly_recessed(qt_app, storage_root, cli_root, monkeypatch) -> None:
+    """Enabled and disabled must not share a fill.
+
+    They did once, so Export Bundle looked clickable while Claude was running;
+    clicking it did nothing and said nothing.
+    """
+    monkeypatch.setattr(app_module, "claude_is_running", lambda: True)
+    win = MigratorWindow(storage_root, cli_root)
+    style = win.styleSheet()
+
+    def block(selector: str) -> str:
+        start = style.index(selector)
+        return style[start : style.index("}", start)]
+
+    enabled_fill = block("QPushButton {").split("background:")[1].split(";")[0].strip()
+    disabled_fill = block("QPushButton:disabled").split("background:")[1].split(";")[0].strip()
+    assert enabled_fill != disabled_fill
+    win.deleteLater()
+
+
+def test_the_banner_offers_a_way_out(qt_app, storage_root, cli_root, monkeypatch) -> None:
+    monkeypatch.setattr(app_module, "claude_is_running", lambda: True)
+    win = MigratorWindow(storage_root, cli_root)
+    assert not win.banner_box.isHidden()
+    assert win.quit_claude_button.isEnabled(), "the only enabled control must be the way out"
+    win.deleteLater()
+
+
+def test_quitting_claude_rescans_and_unblocks(qt_app, storage_root, cli_root, monkeypatch) -> None:
+    state = {"running": True}
+    monkeypatch.setattr(app_module, "claude_is_running", lambda: state["running"])
+    win = MigratorWindow(storage_root, cli_root)
+    assert win.step == STEP_BLOCKED
+
+    def quit_it(*args, **kwargs):
+        state["running"] = False
+
+        class R:
+            returncode = 0
+            stdout = stderr = ""
+
+        return R()
+
+    monkeypatch.setattr(app_module.subprocess, "run", quit_it)
+    win._quit_claude()
+
+    assert win.step == STEP_BACKUP
+    assert win.banner_box.isHidden()
+    assert "Claude has quit." in win.log.toPlainText()
+    win.deleteLater()
+
+
+def test_export_runs_when_nothing_blocks_it(qt_app, window, tmp_path, monkeypatch) -> None:
+    """The button itself, clicked — not the function behind it."""
+    from claude_migrator import backup as backup_module
+
+    monkeypatch.setattr(backup_module, "DOWNLOADS", tmp_path / "Downloads")
+    assert window.export_button.isEnabled()
+    window.export_button.click()
+    assert pump(qt_app, lambda: window._thread is None, 30)
+    assert window.status.text() == "Bundle exported", window.log.toPlainText()
+    assert list((tmp_path / "Downloads").glob("*.zip"))
