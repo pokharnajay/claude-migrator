@@ -89,9 +89,18 @@ class Worker(QObject):
         super().__init__()
         self._job = job
 
+    def log(self, line: str = "") -> None:
+        """Jobs call `log()` with no argument for a blank line.
+
+        `Signal(str).emit` cannot be handed to them directly: it rejects a
+        zero-argument call, and the resulting TypeError surfaced as the whole
+        job having failed.
+        """
+        self.logged.emit(line)
+
     def run(self) -> None:
         try:
-            self.finished.emit(True, self._job(self.progressed.emit, self.logged.emit))
+            self.finished.emit(True, self._job(self.progressed.emit, self.log))
         except Exception as exc:  # reported in the log rather than crashing the app
             self.finished.emit(False, str(exc))
 
@@ -174,6 +183,7 @@ class MigratorWindow(QWidget):
         self.step = STEP_BLOCKED
         self._thread: QThread | None = None
         self._worker: Worker | None = None
+        self._next_step = STEP_BACKUP
 
         self.setWindowTitle("Claude Migrator")
         self.setMinimumSize(800, 720)
@@ -397,6 +407,7 @@ class MigratorWindow(QWidget):
             self.source_rows.append(row)
             self.sources_box.addWidget(row)
 
+        self.say(f"Scanned at     : {datetime.now().strftime('%H:%M:%S')}")
         self.say(f"Signed in as   : {who.label}")
         if who.org_name:
             self.say(f"Organization   : {who.org_name}")
@@ -658,15 +669,36 @@ class MigratorWindow(QWidget):
         self.status.setText(status)
         self.progress.setRange(0, 0)
         self.progress.show()
+        self._next_step = next_step
 
         self._thread = QThread()
         self._worker = Worker(job)
         self._worker.moveToThread(self._thread)
         self._thread.started.connect(self._worker.run)
+
+        # Every receiver below must be a bound method of a QObject living in the
+        # GUI thread. Connecting to a plain callable (a lambda) gives Qt no
+        # receiver to attribute, so it runs the slot directly in the worker
+        # thread — which crashed the app: the slot called wait() on the very
+        # thread it was running in, and the QThread was then destroyed while
+        # still running.
         self._worker.logged.connect(self.say)
         self._worker.progressed.connect(self._on_progress)
-        self._worker.finished.connect(lambda ok, msg: self._on_finished(ok, msg, next_step))
+        self._worker.finished.connect(self._on_finished)
+
+        # Shutdown belongs to the thread itself, never to a slot that might be
+        # executing inside it.
+        self._worker.finished.connect(self._thread.quit)
+        self._thread.finished.connect(self._worker.deleteLater)
+        self._thread.finished.connect(self._on_thread_finished)
         self._thread.start()
+
+    def _on_thread_finished(self) -> None:
+        """Runs in the GUI thread once the worker thread has actually stopped."""
+        thread, self._thread, self._worker = self._thread, None, None
+        if thread is not None:
+            thread.deleteLater()
+        self._set_step(self.step)
 
     def _set_controls_enabled(self, enabled: bool) -> None:
         for widget in (
@@ -683,13 +715,8 @@ class MigratorWindow(QWidget):
         self.progress.setValue(index)
         self.status.setText(f"{index}/{total} · {label}")
 
-    def _on_finished(self, ok: bool, message: str, next_step: int) -> None:
-        if self._thread is not None:
-            self._thread.quit()
-            self._thread.wait()
-            self._thread = None
-            self._worker = None
-
+    def _on_finished(self, ok: bool, message: str) -> None:
+        next_step = self._next_step
         self.progress.hide()
         self._set_controls_enabled(True)
 

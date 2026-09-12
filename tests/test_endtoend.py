@@ -64,3 +64,38 @@ def test_claude_running_check_returns_a_bool() -> None:
     from claude_migrator.ui import claude_is_running
 
     assert isinstance(claude_is_running(), bool)
+
+
+def test_the_whole_flow_through_the_window(storage_root, cli_root, tmp_path, monkeypatch) -> None:
+    """Back Up then Restore Sessions, driven exactly as the buttons drive them."""
+    import os
+
+    os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
+    from PySide6.QtWidgets import QApplication
+
+    from claude_migrator import backup as backup_module
+    from claude_migrator import ui as ui_module
+    from tests.conftest import NEW, NEW_ORG
+    from tests.test_app import pump
+
+    qt_app = QApplication.instance() or QApplication([])
+    monkeypatch.setattr(ui_module, "claude_is_running", lambda: False)
+    monkeypatch.setattr(backup_module, "DOWNLOADS", tmp_path / "Downloads")
+
+    window = ui_module.MigratorWindow(storage_root, cli_root)
+    assert window.step == ui_module.STEP_BACKUP
+
+    window._run_backup()
+    assert pump(qt_app, lambda: window._thread is None, 30), "backup never finished"
+    assert window.backup_verified, window.log.toPlainText()
+    assert window.step == ui_module.STEP_SYNC
+    assert window.backup_path is not None and window.backup_path.is_dir()
+
+    window._run_sync()
+    assert pump(qt_app, lambda: window._thread is None, 30), "restore never finished"
+    assert window.step == ui_module.STEP_DONE
+
+    restored = storage_root / "claude-code-sessions" / NEW / NEW_ORG
+    assert (restored / "local_old0.json").exists()
+    assert "FAILED" not in window.log.toPlainText()
+    window.deleteLater()
