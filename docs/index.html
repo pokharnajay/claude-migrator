@@ -1,0 +1,215 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Claude Migrator — restore Claude history across accounts and Macs</title>
+<meta name="description" content="A small macOS app that restores Claude conversation history hidden by an account switch, and moves it between Macs.">
+<meta property="og:title" content="Claude Migrator">
+<meta property="og:description" content="Your Claude conversations did not disappear. They are just filed under your old account.">
+<meta property="og:image" content="https://pokharnajay.github.io/claude-migrator/screenshot.png">
+<meta name="twitter:card" content="summary_large_image">
+<style>
+  :root{
+    --bg:#faf9f7; --surface:#fff; --border:#e5e3df; --text:#1d1b19;
+    --muted:#6b6661; --accent:#c96442; --accent-ink:#fff; --code:#f3f1ee;
+  }
+  @media (prefers-color-scheme:dark){
+    :root{
+      --bg:#141312; --surface:#1c1b1a; --border:#2e2c2a; --text:#f0eeec;
+      --muted:#9a938c; --code:#232120;
+    }
+  }
+  *{box-sizing:border-box}
+  body{
+    margin:0;background:var(--bg);color:var(--text);
+    font:16px/1.65 -apple-system,BlinkMacSystemFont,"Segoe UI",Inter,sans-serif;
+    -webkit-font-smoothing:antialiased;
+  }
+  .wrap{max-width:880px;margin:0 auto;padding:0 24px}
+  header{text-align:center;padding:88px 0 56px}
+  .mark{
+    width:76px;height:76px;border-radius:19px;margin:0 auto 26px;
+    background:linear-gradient(145deg,#e07a55,#b5573a);
+    display:flex;align-items:center;justify-content:center;
+    box-shadow:0 10px 34px rgba(201,100,66,.3);
+  }
+  .mark svg{width:40px;height:40px}
+  h1{font-size:46px;line-height:1.1;margin:0 0 16px;letter-spacing:-1.4px;font-weight:680}
+  .tagline{font-size:20px;color:var(--muted);margin:0 auto 8px;max-width:560px}
+  .sub{font-size:16px;color:var(--muted);margin:0 auto 36px;max-width:540px}
+  .cta{
+    display:inline-flex;align-items:center;gap:10px;background:var(--accent);
+    color:var(--accent-ink);text-decoration:none;padding:15px 32px;border-radius:11px;
+    font-weight:640;font-size:17px;box-shadow:0 4px 16px rgba(201,100,66,.28);
+    transition:transform .15s ease,box-shadow .15s ease;
+  }
+  .cta:hover{transform:translateY(-2px);box-shadow:0 8px 24px rgba(201,100,66,.36)}
+  .meta{margin-top:14px;font-size:13.5px;color:var(--muted)}
+  .meta a{color:var(--muted)}
+  .shot{
+    margin:56px auto 0;max-width:820px;border-radius:14px;overflow:hidden;
+    border:1px solid var(--border);box-shadow:0 20px 60px rgba(0,0,0,.13);
+  }
+  .shot img{display:block;width:100%}
+  section{padding:52px 0;border-top:1px solid var(--border)}
+  h2{font-size:26px;margin:0 0 18px;letter-spacing:-.5px;font-weight:660}
+  h3{font-size:17px;margin:32px 0 10px;font-weight:640}
+  p{margin:0 0 16px;color:var(--text)}
+  .lead{color:var(--muted)}
+  pre{
+    background:var(--code);border:1px solid var(--border);border-radius:10px;
+    padding:14px 16px;overflow-x:auto;font-size:13.5px;
+    font-family:ui-monospace,"SF Mono",Menlo,monospace;margin:0 0 18px;
+  }
+  code{font-family:ui-monospace,"SF Mono",Menlo,monospace;font-size:.9em}
+  p code,li code{background:var(--code);padding:2px 6px;border-radius:5px}
+  ol.steps{counter-reset:s;list-style:none;padding:0;margin:0}
+  ol.steps>li{
+    counter-increment:s;position:relative;padding:0 0 26px 48px;margin:0;
+  }
+  ol.steps>li::before{
+    content:counter(s);position:absolute;left:0;top:-2px;width:30px;height:30px;
+    border-radius:50%;background:var(--accent);color:#fff;display:flex;
+    align-items:center;justify-content:center;font-size:14px;font-weight:680;
+  }
+  ol.steps>li::after{
+    content:"";position:absolute;left:14.5px;top:32px;bottom:2px;width:1px;background:var(--border);
+  }
+  ol.steps>li:last-child::after{display:none}
+  ol.steps strong{display:block;margin-bottom:4px}
+  .note{
+    background:rgba(201,100,66,.09);border:1px solid rgba(201,100,66,.28);
+    border-radius:10px;padding:14px 18px;margin:0 0 18px;
+  }
+  .note strong{color:var(--accent)}
+  .grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(240px,1fr));gap:14px;margin-top:8px}
+  .card{background:var(--surface);border:1px solid var(--border);border-radius:11px;padding:18px 20px}
+  .card h4{margin:0 0 6px;font-size:15px;font-weight:640}
+  .card p{margin:0;font-size:14px;color:var(--muted);line-height:1.55}
+  table{width:100%;border-collapse:collapse;font-size:14.5px;margin-bottom:18px}
+  th,td{text-align:left;padding:11px 12px;border-bottom:1px solid var(--border);vertical-align:top}
+  th{font-size:12px;text-transform:uppercase;letter-spacing:.7px;color:var(--muted);font-weight:660}
+  footer{padding:44px 0 64px;text-align:center;color:var(--muted);font-size:14px;border-top:1px solid var(--border)}
+  footer a{color:var(--muted)}
+  a{color:var(--accent)}
+  @media(max-width:620px){
+    header{padding:56px 0 40px} h1{font-size:33px} .tagline{font-size:18px}
+  }
+</style>
+</head>
+<body>
+
+<header class="wrap">
+  <div class="mark" aria-hidden="true">
+    <svg viewBox="0 0 24 24" fill="none" stroke="#fff" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round">
+      <rect x="3" y="4" width="10" height="16" rx="2"></rect>
+      <path d="M13 12h8m0 0-3.5-3.5M21 12l-3.5 3.5"></path>
+    </svg>
+  </div>
+  <h1>Claude Migrator</h1>
+  <p class="tagline">Your Claude conversations did not disappear.<br>They are just filed under your old account.</p>
+  <p class="sub">A small macOS app that puts them back — and moves them between Macs.</p>
+
+  <a class="cta" href="https://github.com/pokharnajay/claude-migrator/releases/latest/download/ClaudeMigrator-1.0.dmg">
+    <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.4" stroke-linecap="round" stroke-linejoin="round">
+      <path d="M12 3v12m0 0-4.5-4.5M12 15l4.5-4.5M4 19h16"></path>
+    </svg>
+    Download for macOS
+  </a>
+  <p class="meta">
+    23&nbsp;MB · Apple Silicon · macOS 11+ · free and open source ·
+    <a href="https://github.com/pokharnajay/claude-migrator">source on GitHub</a>
+  </p>
+
+  <div class="shot"><img src="screenshot.png" alt="The Claude Migrator window, listing accounts by e-mail"></div>
+</header>
+
+<main class="wrap">
+
+<section>
+  <h2>What went wrong</h2>
+  <p class="lead">Signing in to Claude with a different account empties the sidebar. It looks like the history was deleted. It was not.</p>
+  <p>Claude's desktop app keys its session storage by account UUID:</p>
+<pre>~/Library/Application Support/Claude/
+  config.json                                        → lastKnownAccountUuid
+  claude-code-sessions/&lt;account&gt;/&lt;org&gt;/local_*.json
+  local-agent-mode-sessions/&lt;account&gt;/&lt;org&gt;/local_*.json</pre>
+  <p>A new sign-in makes the app read a different <code>&lt;account&gt;</code> folder. The old one is still on disk — untouched, and unreachable. Claude Migrator copies it into the account you are actually signed in to.</p>
+</section>
+
+<section>
+  <h2>Install</h2>
+  <ol class="steps">
+    <li><strong>Download the DMG</strong>Open it, drag <em>Claude Migrator</em> into Applications.</li>
+    <li><strong>Allow the first launch</strong>
+      <p>The app is signed but not notarized by Apple, so macOS blocks it once. Open <em>System&nbsp;Settings → Privacy&nbsp;&amp; Security</em>, scroll to the bottom, and click <strong>Open Anyway</strong>.</p>
+      <p>Or in Terminal:</p>
+      <pre>xattr -dr com.apple.quarantine "/Applications/Claude Migrator.app"</pre>
+    </li>
+    <li><strong>Quit Claude</strong>The migrator refuses to write anything while Claude is running, because Claude holds these files open.</li>
+  </ol>
+  <p class="lead">Nothing else to install — the app ships its own Python and Qt.</p>
+</section>
+
+<section>
+  <h2>Restore history on this Mac</h2>
+  <table>
+    <tr><th style="width:170px">Step</th><th>What happens</th></tr>
+    <tr><td><strong>Scan</strong></td><td>Runs on launch. Reads the signed-in account and lists every other account on this Mac by e-mail, with session counts and date ranges. Writes nothing.</td></tr>
+    <tr><td><strong>Back&nbsp;Up</strong></td><td>Clones your entire Claude footprint to <code>~/Downloads/claude-backup-&lt;timestamp&gt;/</code>, then verifies it file-by-file. Restore stays locked until verification passes.</td></tr>
+    <tr><td><strong>Restore Sessions</strong></td><td>Merges the old account's sessions into the signed-in one.</td></tr>
+  </table>
+  <p>Reopen Claude and the conversations are back in the sidebar.</p>
+</section>
+
+<section>
+  <h2>Move history to another Mac</h2>
+  <h3>On the Mac that has the history</h3>
+  <p>Tick the account, press <strong>Export Bundle…</strong>. You get a zip in <code>~/Downloads</code> holding the sessions, the CLI transcripts they need in order to actually open, and a SHA-256 for every file.</p>
+  <h3>On the other Mac</h3>
+  <p>Install Claude Migrator, sign in to Claude, quit Claude, then press <strong>Import Bundle…</strong> and pick the zip. Everything merges into whichever account is signed in there. Anything already present is left alone.</p>
+  <div class="note">
+    <strong>One caveat.</strong> Sessions remember the folder they ran in. If that folder does not exist on the second Mac, the session still opens, but Claude will not find the project files. The import tells you exactly which ones.
+  </div>
+</section>
+
+<section>
+  <h2>What it will not do</h2>
+  <p class="lead">This tool creates files. That is the whole surface area — no code path in it deletes or overwrites anything.</p>
+  <div class="grid">
+    <div class="card"><h4>Never overwrites</h4><p>Files are created with <code>O_EXCL</code>, so the existence check and the write are one atomic step. A file Claude writes at the same moment is left exactly as Claude wrote it.</p></div>
+    <div class="card"><h4>Never half-writes</h4><p>Session folders are staged and moved into place. The archive index is a set union written to a temp file and renamed.</p></div>
+    <div class="card"><h4>Backup first, always</h4><p>File counts and byte totals are compared per item. The restore button does not unlock until that passes.</p></div>
+    <div class="card"><h4>Stays in its lane</h4><p>A symlinked or oddly-named entry resolving outside the folder being migrated is refused outright.</p></div>
+    <div class="card"><h4>Idempotent</h4><p>Running anything twice is a no-op. The second pass finds nothing left to copy.</p></div>
+    <div class="card"><h4>Offline by construction</h4><p>No networking code, and Qt's network module is stripped from the build. Nothing leaves your Mac.</p></div>
+  </div>
+
+  <h3>Imported bundles are treated as hostile</h3>
+  <p>A zip from another machine is untrusted input, validated in full <em>before</em> anything is extracted — and rejected for absolute paths, <code>..</code> traversal, symlink members, unexpected top-level directories, non-UUID workspace segments, file names that are not sessions or transcripts, a missing or future-versioned manifest, or zip-bomb signatures. Every surviving member is checksummed against the manifest and discarded on mismatch.</p>
+</section>
+
+<section>
+  <h2>Build it yourself</h2>
+<pre>git clone https://github.com/pokharnajay/claude-migrator.git
+cd claude-migrator
+
+python3 -m venv .venv-slim
+.venv-slim/bin/pip install pyside6-essentials pyinstaller pytest
+
+QT_QPA_PLATFORM=offscreen .venv-slim/bin/python -m pytest -q   # 105 tests
+./build-app.sh      # → ~/Desktop/Claude Migrator.app
+./build-dmg.sh      # → dist/ClaudeMigrator-&lt;version&gt;.dmg</pre>
+  <p class="lead">Tests never touch real Claude data — they build a synthetic storage tree in a temp directory, including the hostile archives the importer has to refuse.</p>
+</section>
+
+</main>
+
+<footer class="wrap">
+  <p>MIT licensed · <a href="https://github.com/pokharnajay/claude-migrator">github.com/pokharnajay/claude-migrator</a></p>
+  <p>Not affiliated with Anthropic.</p>
+</footer>
+
+</body>
+</html>
