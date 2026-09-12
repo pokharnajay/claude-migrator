@@ -1,0 +1,750 @@
+"""The window.
+
+Two jobs, one screen:
+
+* Restore on this Mac — back up, then merge a previous account's sessions into
+  the signed-in one.
+* Move to another Mac — export a zip here, import it there.
+
+The primary button walks the user through the steps in order and refuses to
+skip one; anything that writes is gated behind a verified backup and a quit
+Claude.
+"""
+
+from __future__ import annotations
+
+import subprocess
+from dataclasses import dataclass
+from datetime import datetime
+from pathlib import Path
+
+from PySide6.QtCore import QObject, Qt, QThread, Signal
+from PySide6.QtGui import QFont, QPalette
+from PySide6.QtWidgets import (
+    QApplication,
+    QCheckBox,
+    QFileDialog,
+    QFrame,
+    QHBoxLayout,
+    QLabel,
+    QMessageBox,
+    QProgressBar,
+    QPushButton,
+    QSizePolicy,
+    QTextEdit,
+    QVBoxLayout,
+    QWidget,
+)
+
+from . import backup, identity, portable, safety, storage, sync
+from .identity import Identity
+from .safety import SafetyError
+from .storage import Account, Org
+
+STEP_BLOCKED, STEP_BACKUP, STEP_SYNC, STEP_DONE = range(4)
+
+ACCENT = "#c96442"
+
+
+def human_bytes(size: int) -> str:
+    value = float(size)
+    for unit in ("B", "KB", "MB", "GB"):
+        if value < 1024 or unit == "GB":
+            return f"{value:.0f} {unit}" if unit in ("B", "KB") else f"{value:.1f} {unit}"
+        value /= 1024
+    return f"{value:.1f} GB"
+
+
+def human_date(stamp: float | None) -> str:
+    return datetime.fromtimestamp(stamp).strftime("%d %b %Y") if stamp else "—"
+
+
+CLAUDE_BINARY_SUFFIX = "Claude.app/Contents/MacOS/Claude"
+
+
+def claude_is_running() -> bool:
+    """True when the desktop app currently has the session files open.
+
+    Matched on the executable path reported by `ps`: `pgrep -x Claude` never
+    matches it, and `pgrep -f` on the same path silently fails to. Requiring the
+    path to *end* with the binary name excludes `Claude Helper` and the CLI.
+    """
+    result = subprocess.run(["ps", "-Ao", "comm="], capture_output=True, text=True)
+    if result.returncode != 0:
+        return False
+    return any(
+        line.strip().endswith(CLAUDE_BINARY_SUFFIX) for line in result.stdout.splitlines()
+    )
+
+
+# --------------------------------------------------------------------------- work
+
+
+class Worker(QObject):
+    progressed = Signal(int, int, str)
+    logged = Signal(str)
+    finished = Signal(bool, str)
+
+    def __init__(self, job) -> None:
+        super().__init__()
+        self._job = job
+
+    def run(self) -> None:
+        try:
+            self.finished.emit(True, self._job(self.progressed.emit, self.logged.emit))
+        except Exception as exc:  # reported in the log rather than crashing the app
+            self.finished.emit(False, str(exc))
+
+
+# --------------------------------------------------------------------------- widgets
+
+
+class Card(QFrame):
+    def __init__(self, title: str) -> None:
+        super().__init__()
+        self.setObjectName("card")
+        outer = QVBoxLayout(self)
+        outer.setContentsMargins(18, 15, 18, 16)
+        outer.setSpacing(10)
+
+        heading = QLabel(title.upper())
+        heading.setObjectName("cardTitle")
+        outer.addWidget(heading)
+
+        self.body = QVBoxLayout()
+        self.body.setSpacing(8)
+        outer.addLayout(self.body)
+
+
+class SourceRow(QWidget):
+    """One selectable account workspace, named by whoever owns it."""
+
+    def __init__(self, account: Account, org: Org, who: Identity) -> None:
+        super().__init__()
+        self.account = account
+        self.org = org
+        self.who = who
+
+        row = QHBoxLayout(self)
+        row.setContentsMargins(0, 3, 0, 3)
+        row.setSpacing(10)
+
+        self.checkbox = QCheckBox()
+        self.checkbox.setChecked(True)
+        row.addWidget(self.checkbox)
+
+        name = QLabel(f"<b>{who.label}</b>")
+        name.setTextFormat(Qt.RichText)
+        name.setToolTip(f"Account {account.uuid}\nWorkspace {org.uuid}")
+        row.addWidget(name)
+        row.addStretch(1)
+
+        detail = QLabel(
+            f"{org.code_sessions} code · {org.agent_sessions} cowork"
+            f"   {human_date(org.first_activity)} – {human_date(org.last_activity)}"
+        )
+        detail.setObjectName("muted")
+        row.addWidget(detail)
+
+    @property
+    def selected(self) -> bool:
+        return self.checkbox.isChecked()
+
+
+# --------------------------------------------------------------------------- window
+
+
+@dataclass
+class Scan:
+    target: Account
+    target_org: Org
+    who: Identity
+    sources: list[tuple[Account, Org, Identity]]
+
+
+class MigratorWindow(QWidget):
+    def __init__(self, app_support: Path, cli_home: Path) -> None:
+        super().__init__()
+        self.app_support = app_support
+        self.cli_home = cli_home
+        self.scan: Scan | None = None
+        self.source_rows: list[SourceRow] = []
+        self.backup_path: Path | None = None
+        self.backup_verified = False
+        self.step = STEP_BLOCKED
+        self._thread: QThread | None = None
+        self._worker: Worker | None = None
+
+        self.setWindowTitle("Claude Migrator")
+        self.setMinimumSize(800, 720)
+        self._build()
+        self._apply_style()
+        self.do_scan()
+
+    # -- layout ------------------------------------------------------------
+
+    def _build(self) -> None:
+        root = QVBoxLayout(self)
+        root.setContentsMargins(28, 24, 28, 22)
+        root.setSpacing(14)
+
+        title = QLabel("Claude Migrator")
+        title.setObjectName("title")
+        root.addWidget(title)
+
+        subtitle = QLabel(
+            "Restores Claude conversation history that disappears after signing in to a "
+            "different account, and moves it between Macs."
+        )
+        subtitle.setObjectName("muted")
+        subtitle.setWordWrap(True)
+        root.addWidget(subtitle)
+
+        self.banner = QLabel()
+        self.banner.setObjectName("banner")
+        self.banner.setWordWrap(True)
+        self.banner.hide()
+        root.addWidget(self.banner)
+
+        accounts = Card("Accounts")
+        self.target_label = QLabel()
+        self.target_label.setWordWrap(True)
+        accounts.body.addWidget(self.target_label)
+
+        divider = QFrame()
+        divider.setObjectName("divider")
+        divider.setFixedHeight(1)
+        accounts.body.addWidget(divider)
+
+        self.sources_label = QLabel("Restore history from")
+        self.sources_label.setObjectName("muted")
+        accounts.body.addWidget(self.sources_label)
+
+        self.sources_box = QVBoxLayout()
+        self.sources_box.setSpacing(0)
+        accounts.body.addLayout(self.sources_box)
+        root.addWidget(accounts)
+
+        backup_card = Card("Backup")
+        self.transcripts = QCheckBox("Include CLI transcripts (~/.claude/projects)")
+        self.transcripts.setChecked(True)
+        self.transcripts.stateChanged.connect(self._refresh_backup_label)
+        backup_card.body.addWidget(self.transcripts)
+        self.backup_label = QLabel()
+        self.backup_label.setObjectName("muted")
+        self.backup_label.setWordWrap(True)
+        backup_card.body.addWidget(self.backup_label)
+        root.addWidget(backup_card)
+
+        self.log = QTextEdit()
+        self.log.setReadOnly(True)
+        self.log.setObjectName("log")
+        self.log.setFont(QFont("Menlo", 11))
+        self.log.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Expanding)
+        root.addWidget(self.log, 1)
+
+        self.progress = QProgressBar()
+        self.progress.setTextVisible(False)
+        self.progress.setFixedHeight(4)
+        self.progress.hide()
+        root.addWidget(self.progress)
+
+        transfer = QHBoxLayout()
+        transfer.setSpacing(10)
+        transfer_label = QLabel("Another Mac")
+        transfer_label.setObjectName("muted")
+        transfer.addWidget(transfer_label)
+        self.export_button = QPushButton("Export Bundle…")
+        self.export_button.setToolTip(
+            "Write the selected history to a zip you can carry to another Mac."
+        )
+        self.export_button.clicked.connect(self._run_export)
+        transfer.addWidget(self.export_button)
+        self.import_button = QPushButton("Import Bundle…")
+        self.import_button.setToolTip(
+            "Read a zip exported from another Mac into this account."
+        )
+        self.import_button.clicked.connect(self._run_import)
+        transfer.addWidget(self.import_button)
+        transfer.addStretch(1)
+        root.addLayout(transfer)
+
+        buttons = QHBoxLayout()
+        buttons.setSpacing(10)
+        self.status = QLabel()
+        self.status.setObjectName("muted")
+        buttons.addWidget(self.status)
+        buttons.addStretch(1)
+
+        self.rescan_button = QPushButton("Rescan")
+        self.rescan_button.clicked.connect(self.do_scan)
+        buttons.addWidget(self.rescan_button)
+
+        self.reveal_button = QPushButton("Show in Finder")
+        self.reveal_button.clicked.connect(self._reveal)
+        self.reveal_button.hide()
+        buttons.addWidget(self.reveal_button)
+
+        self.action_button = QPushButton("Back Up")
+        self.action_button.setObjectName("primary")
+        self.action_button.setDefault(True)
+        self.action_button.clicked.connect(self._advance)
+        buttons.addWidget(self.action_button)
+        root.addLayout(buttons)
+
+    def _apply_style(self) -> None:
+        dark = self.palette().color(QPalette.Window).lightness() < 128
+        surface = "#1c1c1e" if dark else "#ffffff"
+        border = "#323235" if dark else "#e3e3e6"
+        muted = "#8e8e93" if dark else "#6e6e73"
+        log_bg = "#141416" if dark else "#fafafa"
+
+        self.setStyleSheet(f"""
+            QWidget {{
+                font-family: '.AppleSystemUIFont', 'Helvetica Neue', Helvetica;
+                font-size: 13px;
+            }}
+            #title {{ font-size: 21px; font-weight: 600; }}
+            #muted {{ color: {muted}; }}
+            #cardTitle {{
+                font-size: 10px; font-weight: 700; color: {muted}; letter-spacing: 1.1px;
+            }}
+            #card {{
+                background: {surface}; border: 1px solid {border}; border-radius: 10px;
+            }}
+            #divider {{ background: {border}; border: none; }}
+            #banner {{
+                background: rgba(201,100,66,0.12); color: {ACCENT};
+                border: 1px solid rgba(201,100,66,0.35);
+                border-radius: 8px; padding: 9px 12px;
+            }}
+            #log {{
+                background: {log_bg}; border: 1px solid {border};
+                border-radius: 10px; padding: 10px; color: {muted};
+            }}
+            QPushButton {{
+                background: {surface}; border: 1px solid {border};
+                border-radius: 7px; padding: 7px 16px;
+            }}
+            QPushButton:hover {{ border-color: {muted}; }}
+            QPushButton#primary {{
+                background: {ACCENT}; border: 1px solid {ACCENT};
+                color: white; font-weight: 600; padding: 7px 22px;
+            }}
+            QPushButton#primary:hover {{ background: #b5573a; }}
+            QPushButton:disabled {{ color: {muted}; background: transparent; }}
+            QProgressBar {{ background: {border}; border: none; border-radius: 2px; }}
+            QProgressBar::chunk {{ background: {ACCENT}; border-radius: 2px; }}
+        """)
+
+    # -- logging -----------------------------------------------------------
+
+    def say(self, line: str = "") -> None:
+        self.log.append(line)
+        bar = self.log.verticalScrollBar()
+        bar.setValue(bar.maximum())
+
+    # -- scan --------------------------------------------------------------
+
+    def do_scan(self) -> None:
+        self.log.clear()
+        self.scan = None
+        self.backup_path = None
+        self.backup_verified = False
+        self.reveal_button.hide()
+        for row in self.source_rows:
+            row.setParent(None)
+        self.source_rows.clear()
+        self.sources_label.setText("Restore history from")
+
+        current = storage.current_account_uuid(self.app_support)
+        accounts = storage.discover_accounts(self.app_support)
+        people = identity.resolve_identities(self.app_support, self.cli_home)
+
+        if not accounts:
+            self._halt("No Claude storage found on this Mac.")
+            return
+        if current is None:
+            self._halt("Could not read the signed-in account from Claude's config.json.")
+            return
+
+        target = next((a for a in accounts if a.uuid == current), None)
+        target_org = storage.active_org(target) if target else None
+        if target is None or target_org is None:
+            self._halt("The signed-in account has no workspace yet. Open Claude once, then rescan.")
+            return
+
+        who = identity.describe(current, people)
+        sources = [
+            (account, org, identity.describe(account.uuid, people))
+            for account in accounts
+            if account.uuid != current
+            for org in account.orgs
+            if org.total_sessions > 0  # empty workspaces are a sign-in artefact
+        ]
+        self.scan = Scan(target=target, target_org=target_org, who=who, sources=sources)
+
+        second = f"<br><span style='color:palette(mid);'>{who.sublabel}</span>" if who.sublabel else ""
+        self.target_label.setText(
+            f"Signed in as <b>{who.label}</b>{second}"
+            f"<br><span style='color:palette(mid);'>Holds {target_org.total_sessions} session(s). "
+            f"Restored history lands here.</span>"
+        )
+        self.target_label.setToolTip(f"Account {target.uuid}\nWorkspace {target_org.uuid}")
+
+        for account, org, person in sources:
+            row = SourceRow(account, org, person)
+            self.source_rows.append(row)
+            self.sources_box.addWidget(row)
+
+        self.say(f"Signed in as   : {who.label}")
+        if who.org_name:
+            self.say(f"Organization   : {who.org_name}")
+        self.say(f"Other accounts : {len({a.uuid for a, _, _ in sources})}")
+        self.say()
+
+        if not sources:
+            self.sources_label.setText("No other accounts on this Mac.")
+            self.say("Nothing to restore locally. You can still import a bundle from another Mac.")
+        else:
+            total = sum(org.total_sessions for _, org, _ in sources)
+            self.say(f"{total} session(s) available to restore.")
+
+        self._refresh_backup_label()
+        self._check_claude_running()
+
+    def _check_claude_running(self) -> bool:
+        """Writing is gated on Claude being closed. Returns True when blocked."""
+        running = claude_is_running()
+        if running:
+            self.banner.setText(
+                "<b>Quit Claude before continuing.</b> It has these session files open, "
+                "and it rewrites its own index while running. Quit it, then press Rescan."
+            )
+            self.banner.show()
+            self._set_step(STEP_BLOCKED)
+        else:
+            self.banner.hide()
+            self._set_step(STEP_BACKUP if self.scan else STEP_BLOCKED)
+        return running
+
+    def _halt(self, message: str) -> None:
+        self.say(message)
+        self.status.setText(message)
+        self._set_step(STEP_BLOCKED)
+
+    # -- shared helpers ----------------------------------------------------
+
+    def _selected_orgs(self) -> list[Org]:
+        return [row.org for row in self.source_rows if row.selected]
+
+    def _refresh_backup_label(self) -> None:
+        items = backup.backup_items(self.app_support, self.cli_home, self.transcripts.isChecked())
+        self.backup_label.setText(
+            f"{len(items)} item(s), {human_bytes(backup.total_size(items))} "
+            "→ ~/Downloads/claude-backup-<timestamp>\n"
+            "Cloned on APFS: near-instant, and almost no extra disk until something changes."
+        )
+
+    def _busy(self) -> bool:
+        return self._thread is not None
+
+    def _guard(self, needs_sources: bool = True) -> bool:
+        """Common preconditions. Returns True when it is safe to proceed."""
+        if self._busy():
+            return False
+        if self.scan is None:
+            self.say("Nothing scanned yet — press Rescan.")
+            return False
+        if claude_is_running():
+            self._check_claude_running()
+            self.say("Claude is still running. Quit it first.")
+            return False
+        if needs_sources and not self._selected_orgs():
+            self.say("Select at least one account first.")
+            return False
+        return True
+
+    # -- back up & restore -------------------------------------------------
+
+    def _advance(self) -> None:
+        if self.step == STEP_BACKUP:
+            self._run_backup()
+        elif self.step == STEP_SYNC:
+            self._run_sync()
+
+    def _run_backup(self) -> None:
+        if not self._guard():
+            return
+        items = backup.backup_items(self.app_support, self.cli_home, self.transcripts.isChecked())
+        account = self.scan.target.uuid
+
+        def job(progress, log):
+            log("Backing up…")
+            outcome = backup.run_backup_verified(
+                backup.DOWNLOADS, items, progress=progress, current_account=account
+            )
+            self.backup_path = outcome.path
+            self.backup_verified = outcome.verified
+            log(f"Written to {outcome.path}")
+            log()
+            for line in outcome.findings:
+                log("  " + line)
+            log()
+            if not outcome.verified:
+                raise SafetyError(
+                    "Backup could not be verified — refusing to go further. "
+                    "Nothing has been changed."
+                )
+            log("Backup verified.")
+            return "Backup verified"
+
+        self._start(job, "Backing up…", STEP_SYNC)
+
+    def _run_sync(self) -> None:
+        if not self._guard():
+            return
+        if not self.backup_verified:
+            self.say("Refusing to restore without a verified backup. Run Back Up first.")
+            return
+
+        try:
+            plan = sync.plan_sync(
+                self.app_support, self.scan.target, self.scan.target_org, self._selected_orgs()
+            )
+        except (ValueError, SafetyError) as exc:
+            self.say(str(exc))
+            return
+
+        if not plan.to_copy and not plan.archived_additions:
+            self.say("Nothing to restore — every session is already in this account.")
+            self._set_step(STEP_DONE)
+            return
+
+        target_uuid = self.scan.target.uuid
+        projects = self.cli_home / "projects"
+        app_support = self.app_support
+
+        def job(progress, log):
+            log()
+            log(f"Restoring {plan.session_count} session(s), {human_bytes(plan.total_bytes)}…")
+            result = sync.execute(plan, progress=progress)
+            log(f"Copied           : {result.copied}")
+            log(f"Already present  : {len(plan.already_present) + result.skipped_existing}")
+            if result.archived_merged:
+                log(f"Archive flags    : {result.archived_merged} merged")
+            for path, error in result.failed:
+                log(f"FAILED {path.name}: {error}")
+
+            org = storage.active_org(storage.find_account(app_support, target_uuid))
+            missing = sync.missing_transcripts(org, projects) if org else []
+            if missing:
+                log()
+                log(f"{len(missing)} session(s) will open empty — transcript no longer on disk:")
+                for ref in missing[:12]:
+                    log(f"  · {ref.title}")
+                if len(missing) > 12:
+                    log(f"  … and {len(missing) - 12} more")
+            log()
+            log("Open Claude to see the restored sessions.")
+            if result.failed:
+                raise SafetyError(f"{len(result.failed)} item(s) failed — see above.")
+            return f"Restored {result.copied} item(s)"
+
+        self._start(job, "Restoring…", STEP_DONE)
+
+    # -- transfer between Macs ---------------------------------------------
+
+    def _run_export(self) -> None:
+        if not self._guard():
+            return
+        orgs = self._selected_orgs()
+        label = next(
+            (row.who.label for row in self.source_rows if row.selected),
+            self.scan.who.label,
+        )
+        projects = self.cli_home / "projects"
+
+        def job(progress, log):
+            log()
+            log("Building bundle…")
+            summary = portable.export_bundle(
+                backup.DOWNLOADS, orgs, projects, label, progress=progress
+            )
+            self.backup_path = summary.path
+            log(f"Bundle    : {summary.path}")
+            log(f"Sessions  : {summary.sessions}")
+            log(f"Transcripts: {summary.transcripts}")
+            if summary.missing_transcripts:
+                log()
+                log(
+                    f"{len(summary.missing_transcripts)} session(s) have no transcript on "
+                    "this Mac and will open empty on the other one:"
+                )
+                for title in summary.missing_transcripts[:10]:
+                    log(f"  · {title}")
+            log()
+            log("Copy this zip to the other Mac, open Claude Migrator there,")
+            log("and press Import Bundle.")
+            return "Bundle exported"
+
+        self._start(job, "Exporting…", self.step)
+
+    def _run_import(self) -> None:
+        if not self._guard(needs_sources=False):
+            return
+
+        chosen, _ = QFileDialog.getOpenFileName(
+            self, "Choose a bundle exported from another Mac", str(backup.DOWNLOADS), "Zip archives (*.zip)"
+        )
+        if not chosen:
+            return
+        bundle = Path(chosen)
+
+        try:
+            info = portable.inspect_bundle(bundle)
+        except SafetyError as exc:
+            self.say(str(exc))
+            QMessageBox.critical(self, "Bundle rejected", str(exc))
+            return
+
+        confirm = QMessageBox.question(
+            self,
+            "Import this bundle?",
+            f"{bundle.name}\n\n"
+            f"From: {info.label}\n"
+            f"Exported: {info.exported_at[:19].replace('T', ' ')}\n"
+            f"Sessions: {info.sessions}   Transcripts: {info.transcripts}\n\n"
+            f"They will be merged into {self.scan.who.label}. "
+            "Nothing already on this Mac is overwritten.",
+        )
+        if confirm != QMessageBox.Yes:
+            return
+
+        app_support = self.app_support
+        cli_home = self.cli_home
+        account = self.scan.target.uuid
+        org = self.scan.target_org.uuid
+
+        def job(progress, log):
+            log()
+            log(f"Importing {bundle.name}…")
+            result = portable.import_bundle(
+                bundle, app_support, cli_home, account, org, progress=progress
+            )
+            log(f"Sessions copied    : {result.sessions_copied}")
+            log(f"Transcripts copied : {result.transcripts_copied}")
+            log(f"Already present    : {result.skipped_existing}")
+            for name, error in result.failed:
+                log(f"FAILED {name}: {error}")
+            if result.unknown_cwds:
+                log()
+                log("These sessions point at folders that do not exist on this Mac:")
+                for cwd in result.unknown_cwds[:10]:
+                    log(f"  · {cwd}")
+                log("They will open, but Claude will not find the project files.")
+            log()
+            log("Open Claude to see the imported sessions.")
+            if result.failed:
+                raise SafetyError(f"{len(result.failed)} item(s) failed — see above.")
+            return f"Imported {result.sessions_copied} session(s)"
+
+        self._start(job, "Importing…", self.step)
+
+    # -- threading ---------------------------------------------------------
+
+    def _start(self, job, status: str, next_step: int) -> None:
+        self._set_controls_enabled(False)
+        self.status.setText(status)
+        self.progress.setRange(0, 0)
+        self.progress.show()
+
+        self._thread = QThread()
+        self._worker = Worker(job)
+        self._worker.moveToThread(self._thread)
+        self._thread.started.connect(self._worker.run)
+        self._worker.logged.connect(self.say)
+        self._worker.progressed.connect(self._on_progress)
+        self._worker.finished.connect(lambda ok, msg: self._on_finished(ok, msg, next_step))
+        self._thread.start()
+
+    def _set_controls_enabled(self, enabled: bool) -> None:
+        for widget in (
+            self.action_button,
+            self.rescan_button,
+            self.export_button,
+            self.import_button,
+            self.transcripts,
+        ):
+            widget.setEnabled(enabled)
+
+    def _on_progress(self, index: int, total: int, label: str) -> None:
+        self.progress.setRange(0, total)
+        self.progress.setValue(index)
+        self.status.setText(f"{index}/{total} · {label}")
+
+    def _on_finished(self, ok: bool, message: str, next_step: int) -> None:
+        if self._thread is not None:
+            self._thread.quit()
+            self._thread.wait()
+            self._thread = None
+            self._worker = None
+
+        self.progress.hide()
+        self._set_controls_enabled(True)
+
+        if self.backup_path is not None:
+            self.reveal_button.show()
+
+        if not ok:
+            self.say(f"Stopped: {message}")
+            self.status.setText("Stopped")
+            self._set_step(self.step)  # stay where we were; nothing advanced
+            return
+
+        self.status.setText(message)
+        self._set_step(next_step)
+
+    def _set_step(self, step: int) -> None:
+        self.step = step
+        labels = {
+            STEP_BLOCKED: ("Back Up", False),
+            STEP_BACKUP: ("Back Up", True),
+            STEP_SYNC: ("Restore Sessions", True),
+            STEP_DONE: ("Done", False),
+        }
+        text, enabled = labels[step]
+        self.action_button.setText(text)
+
+        has_sources = bool(self.source_rows)
+        if step == STEP_SYNC and not has_sources:
+            enabled = False
+        self.action_button.setEnabled(enabled and not self._busy())
+
+        blocked = step == STEP_BLOCKED
+        self.export_button.setEnabled(has_sources and not blocked and not self._busy())
+        self.import_button.setEnabled(self.scan is not None and not blocked and not self._busy())
+
+    def _reveal(self) -> None:
+        if self.backup_path:
+            subprocess.run(["open", "-R", str(self.backup_path)])
+
+
+def main() -> int:
+    app = QApplication([])
+    app.setApplicationName("Claude Migrator")
+    app.setApplicationDisplayName("Claude Migrator")
+
+    lock = safety.SingleInstance(Path.home() / "Library" / "Caches" / "claude-migrator.lock")
+    try:
+        lock.__enter__()
+    except SafetyError as exc:
+        QMessageBox.warning(None, "Claude Migrator", str(exc))
+        return 1
+
+    try:
+        window = MigratorWindow(storage.APP_SUPPORT, storage.CLI_HOME)
+        window.show()
+        return app.exec()
+    finally:
+        lock.__exit__()
