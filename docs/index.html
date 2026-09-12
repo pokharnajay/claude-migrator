@@ -45,18 +45,28 @@
     transition:transform .15s ease,box-shadow .15s ease;
   }
   .cta:hover{transform:translateY(-2px);box-shadow:0 8px 24px rgba(201,100,66,.36)}
-  .run{position:relative;max-width:600px;margin:0 auto}
-  .hero-code{
-    text-align:left;background:var(--code);border:1px solid var(--border);
-    border-radius:12px;padding:20px 24px;margin:0;font-size:14.5px;line-height:1.9;
-    font-family:ui-monospace,"SF Mono",Menlo,monospace;overflow-x:auto;
+  .run{
+    max-width:600px;margin:0 auto;text-align:left;
+    border:1px solid var(--border);border-radius:12px;overflow:hidden;
   }
-  .hero-code .c{display:block;white-space:nowrap}
+  .run-bar{
+    display:flex;align-items:center;justify-content:space-between;
+    padding:8px 10px 8px 16px;background:var(--surface);
+    border-bottom:1px solid var(--border);
+    font-size:12px;letter-spacing:.6px;text-transform:uppercase;color:var(--muted);
+  }
+  .hero-code{
+    background:var(--code);border:none;border-radius:0;
+    padding:16px 20px;margin:0;font-size:14.5px;line-height:1.75;
+    font-family:ui-monospace,"SF Mono",Menlo,monospace;
+    white-space:pre-wrap;overflow-wrap:anywhere;
+  }
+  .hero-code .c{display:block}
   .hero-code .c::before{content:"$ ";color:var(--accent);font-weight:700}
   .copy{
-    position:absolute;top:10px;right:10px;background:var(--surface);
-    border:1px solid var(--border);color:var(--muted);border-radius:7px;
-    padding:5px 12px;font-size:12.5px;cursor:pointer;font-family:inherit;
+    background:var(--code);border:1px solid var(--border);color:var(--muted);
+    border-radius:7px;padding:5px 12px;font-size:12px;cursor:pointer;
+    font-family:inherit;letter-spacing:0;text-transform:none;
   }
   .copy:hover{color:var(--text);border-color:var(--muted)}
   .copy.done{color:var(--accent);border-color:var(--accent)}
@@ -74,7 +84,7 @@
   .lead{color:var(--muted)}
   pre{
     background:var(--code);border:1px solid var(--border);border-radius:10px;
-    padding:14px 16px;overflow-x:auto;font-size:13.5px;
+    padding:14px 16px;font-size:13.5px;white-space:pre-wrap;overflow-wrap:anywhere;
     font-family:ui-monospace,"SF Mono",Menlo,monospace;margin:0 0 18px;
   }
   code{font-family:ui-monospace,"SF Mono",Menlo,monospace;font-size:.9em}
@@ -127,10 +137,13 @@
   <p class="sub">A small macOS app that puts them back — and moves them between Macs.</p>
 
   <div class="run">
+    <div class="run-bar">
+      <span>Terminal</span>
+      <button class="copy" id="copy">Copy</button>
+    </div>
     <pre class="hero-code"><span class="c">git clone https://github.com/pokharnajay/claude-migrator.git</span>
 <span class="c">cd claude-migrator</span>
 <span class="c">python3 app.py</span></pre>
-    <button class="copy" id="copy">Copy</button>
   </div>
   <p class="meta">
     macOS 11+ · Python 3.10+ · free and open source ·
