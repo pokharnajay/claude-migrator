@@ -89,7 +89,7 @@ Claude Migrator copies it into the account you are actually signed in to.
 
 | Step | What happens |
 |------|--------------|
-| **1. Scan** | Runs on launch. Reads the signed-in account, lists every other account on this Mac by e-mail, with session counts and date ranges. Writes nothing. |
+| **1. Scan** | Runs on launch, and again on **Rescan**. Reports what the signed-in account already holds — session counts, date range, and its most recent conversation — alongside every other account on this Mac, by e-mail. Writes nothing. |
 | **2. Back Up** | Clones your entire Claude footprint to `~/Downloads/claude-backup-<timestamp>/`, then verifies it file-by-file. **Restore stays locked until verification passes.** |
 | **3. Restore Sessions** | Merges the old account's sessions into the signed-in one. |
 

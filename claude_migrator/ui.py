@@ -125,10 +125,27 @@ class Card(QFrame):
         outer.addLayout(self.body)
 
 
-class SourceRow(QWidget):
-    """One selectable account workspace, named by whoever owns it."""
+def describe_workspace(org: Org) -> str:
+    """The same one-line summary for every account, signed-in or not."""
+    if org.total_sessions == 0:
+        return "no sessions"
+    return (
+        f"{org.code_sessions} code · {org.agent_sessions} cowork"
+        f"   {human_date(org.first_activity)} – {human_date(org.last_activity)}"
+    )
 
-    def __init__(self, account: Account, org: Org, who: Identity) -> None:
+
+class AccountRow(QWidget):
+    """One account workspace, named by whoever owns it.
+
+    The signed-in account is shown with exactly the same detail as the ones it
+    can pull from, so the scan says what you already have as well as what you
+    stand to gain.
+    """
+
+    def __init__(
+        self, account: Account, org: Org, who: Identity, selectable: bool = True
+    ) -> None:
         super().__init__()
         self.account = account
         self.org = org
@@ -138,26 +155,34 @@ class SourceRow(QWidget):
         row.setContentsMargins(0, 3, 0, 3)
         row.setSpacing(10)
 
-        self.checkbox = QCheckBox()
-        self.checkbox.setChecked(True)
-        row.addWidget(self.checkbox)
+        self.checkbox = QCheckBox() if selectable else None
+        if self.checkbox is not None:
+            self.checkbox.setChecked(True)
+            row.addWidget(self.checkbox)
+        else:
+            spacer = QLabel()
+            spacer.setFixedWidth(18)
+            row.addWidget(spacer)
 
         name = QLabel(f"<b>{who.label}</b>")
         name.setTextFormat(Qt.RichText)
         name.setToolTip(f"Account {account.uuid}\nWorkspace {org.uuid}")
         row.addWidget(name)
+
+        if len(account.orgs) > 1:
+            workspace = QLabel(f"workspace {org.uuid.split('-')[0]}")
+            workspace.setObjectName("muted")
+            row.addWidget(workspace)
+
         row.addStretch(1)
 
-        detail = QLabel(
-            f"{org.code_sessions} code · {org.agent_sessions} cowork"
-            f"   {human_date(org.first_activity)} – {human_date(org.last_activity)}"
-        )
+        detail = QLabel(describe_workspace(org))
         detail.setObjectName("muted")
         row.addWidget(detail)
 
     @property
     def selected(self) -> bool:
-        return self.checkbox.isChecked()
+        return self.checkbox is not None and self.checkbox.isChecked()
 
 
 # --------------------------------------------------------------------------- window
@@ -177,7 +202,8 @@ class MigratorWindow(QWidget):
         self.app_support = app_support
         self.cli_home = cli_home
         self.scan: Scan | None = None
-        self.source_rows: list[SourceRow] = []
+        self.source_rows: list[AccountRow] = []
+        self.target_rows: list[AccountRow] = []
         self.backup_path: Path | None = None
         self.backup_verified = False
         self.step = STEP_BLOCKED
@@ -220,6 +246,10 @@ class MigratorWindow(QWidget):
         self.target_label = QLabel()
         self.target_label.setWordWrap(True)
         accounts.body.addWidget(self.target_label)
+
+        self.target_box = QVBoxLayout()
+        self.target_box.setSpacing(0)
+        accounts.body.addLayout(self.target_box)
 
         divider = QFrame()
         divider.setObjectName("divider")
@@ -308,6 +338,12 @@ class MigratorWindow(QWidget):
         border = "#323235" if dark else "#e3e3e6"
         muted = "#8e8e93" if dark else "#6e6e73"
         log_bg = "#141416" if dark else "#fafafa"
+        # Buttons need more contrast than the cards do, or a disabled one reads
+        # as a line of plain text rather than a control that is switched off.
+        button_bg = "#2c2c2f" if dark else "#ffffff"
+        button_border = "#48484d" if dark else "#c8c6c2"
+        button_off_bg = "#1f1f21" if dark else "#f2f1ef"
+        button_off_border = "#38383c" if dark else "#dcdad6"
 
         self.setStyleSheet(f"""
             QWidget {{
@@ -333,16 +369,29 @@ class MigratorWindow(QWidget):
                 border-radius: 10px; padding: 10px; color: {muted};
             }}
             QPushButton {{
-                background: {surface}; border: 1px solid {border};
-                border-radius: 7px; padding: 7px 16px;
+                background: {button_bg};
+                border: 1px solid {button_border};
+                border-radius: 7px;
+                padding: 7px 16px;
+                font-weight: 500;
             }}
-            QPushButton:hover {{ border-color: {muted}; }}
+            QPushButton:hover {{ border-color: {ACCENT}; }}
+            QPushButton:pressed {{ background: {button_off_bg}; }}
             QPushButton#primary {{
                 background: {ACCENT}; border: 1px solid {ACCENT};
                 color: white; font-weight: 600; padding: 7px 22px;
             }}
-            QPushButton#primary:hover {{ background: #b5573a; }}
-            QPushButton:disabled {{ color: {muted}; background: transparent; }}
+            QPushButton#primary:hover {{ background: #b5573a; border-color: #b5573a; }}
+            QPushButton:disabled {{
+                color: {muted};
+                background: {button_off_bg};
+                border: 1px solid {button_off_border};
+            }}
+            QPushButton#primary:disabled {{
+                background: {button_off_bg};
+                border: 1px solid {button_off_border};
+                color: {muted};
+            }}
             QProgressBar {{ background: {border}; border: none; border-radius: 2px; }}
             QProgressBar::chunk {{ background: {ACCENT}; border-radius: 2px; }}
         """)
@@ -362,9 +411,10 @@ class MigratorWindow(QWidget):
         self.backup_path = None
         self.backup_verified = False
         self.reveal_button.hide()
-        for row in self.source_rows:
+        for row in self.source_rows + self.target_rows:
             row.setParent(None)
         self.source_rows.clear()
+        self.target_rows.clear()
         self.sources_label.setText("Restore history from")
 
         current = storage.current_account_uuid(self.app_support)
@@ -394,16 +444,15 @@ class MigratorWindow(QWidget):
         ]
         self.scan = Scan(target=target, target_org=target_org, who=who, sources=sources)
 
-        second = f"<br><span style='color:palette(mid);'>{who.sublabel}</span>" if who.sublabel else ""
-        self.target_label.setText(
-            f"Signed in as <b>{who.label}</b>{second}"
-            f"<br><span style='color:palette(mid);'>Holds {target_org.total_sessions} session(s). "
-            f"Restored history lands here.</span>"
-        )
-        self.target_label.setToolTip(f"Account {target.uuid}\nWorkspace {target_org.uuid}")
+        self.target_label.setText("Signed in as")
+        self.target_label.setObjectName("muted")
+        for org in target.orgs:
+            row = AccountRow(target, org, who, selectable=False)
+            self.target_rows.append(row)
+            self.target_box.addWidget(row)
 
         for account, org, person in sources:
-            row = SourceRow(account, org, person)
+            row = AccountRow(account, org, person)
             self.source_rows.append(row)
             self.sources_box.addWidget(row)
 
@@ -411,6 +460,25 @@ class MigratorWindow(QWidget):
         self.say(f"Signed in as   : {who.label}")
         if who.org_name:
             self.say(f"Organization   : {who.org_name}")
+        self.say()
+        self.say("This account already holds")
+        for org in target.orgs:
+            marker = "→" if org.uuid == target_org.uuid else " "
+            self.say(f"  {marker} {org.uuid[:8]}  {describe_workspace(org)}")
+        latest = sync.read_sessions(target_org, trees=(storage.CODE_TREE,))
+        if latest:
+            newest = max(
+                (p for p in (target_org.code_dir.glob("local_*.json") if target_org.code_dir else [])),
+                key=lambda p: p.stat().st_mtime,
+                default=None,
+            )
+            if newest is not None:
+                title = next(
+                    (r.title for r in latest if r.session_file == newest.name), "Untitled"
+                )
+                when = datetime.fromtimestamp(newest.stat().st_mtime).strftime("%d %b %Y %H:%M")
+                self.say(f"    most recent: {title}  ({when})")
+        self.say()
         self.say(f"Other accounts : {len({a.uuid for a, _, _ in sources})}")
         self.say()
 

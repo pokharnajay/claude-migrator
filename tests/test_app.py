@@ -208,3 +208,71 @@ def test_a_job_can_log_a_blank_line(qt_app, window) -> None:
     assert window.status.text() == "ok", window.log.toPlainText()
     text = window.log.toPlainText()
     assert "first" in text and "second" in text
+
+
+# ------------------------------------------------ the signed-in account itself
+
+
+def test_the_signed_in_account_gets_a_row_too(window) -> None:
+    assert window.target_rows, "the account being restored into was not shown"
+    assert window.target_rows[0].account.uuid == window.scan.target.uuid
+
+
+def test_the_signed_in_row_cannot_be_deselected(window) -> None:
+    """It is the destination, not a source — there is nothing to tick."""
+    row = window.target_rows[0]
+    assert row.checkbox is None
+    assert row.selected is False
+
+
+def test_the_signed_in_account_reports_its_own_sessions(window) -> None:
+    from claude_migrator.ui import describe_workspace
+
+    org = window.scan.target_org
+    summary = describe_workspace(org)
+    assert f"{org.code_sessions} code" in summary
+    assert f"{org.agent_sessions} cowork" in summary
+
+
+def test_the_scan_log_says_what_is_already_held(window) -> None:
+    text = window.log.toPlainText()
+    assert "This account already holds" in text
+    assert window.scan.target_org.uuid[:8] in text
+
+
+def test_the_scan_names_the_most_recent_session(window) -> None:
+    """So a rescan visibly reflects work done since the last one."""
+    assert "most recent:" in window.log.toPlainText()
+
+
+def test_an_empty_workspace_says_so_rather_than_showing_zeroes() -> None:
+    from claude_migrator.storage import Org
+    from claude_migrator.ui import describe_workspace
+
+    empty = Org(
+        uuid="x", account_uuid="y", code_dir=None, agent_dir=None,
+        code_sessions=0, agent_sessions=0, first_activity=None, last_activity=None,
+    )
+    assert describe_workspace(empty) == "no sessions"
+
+
+def test_rescan_refreshes_the_signed_in_rows_without_duplicating_them(window) -> None:
+    before = len(window.target_rows)
+    window.do_scan()
+    window.do_scan()
+    assert len(window.target_rows) == before
+
+
+# ------------------------------------------------------------ button legibility
+
+
+def test_disabled_buttons_keep_a_background_and_border(qt_app, storage_root, cli_root, monkeypatch) -> None:
+    """A disabled button with a transparent background reads as plain text."""
+    monkeypatch.setattr(app_module, "claude_is_running", lambda: True)
+    win = MigratorWindow(storage_root, cli_root)
+    style = win.styleSheet()
+    disabled = style[style.index("QPushButton:disabled"):]
+    block = disabled[: disabled.index("}")]
+    assert "background: transparent" not in block
+    assert "border:" in block
+    win.deleteLater()
