@@ -19,13 +19,21 @@ from __future__ import annotations
 
 import json
 import re
+import time
 from dataclasses import dataclass
 from pathlib import Path
 
 UUID_PATTERN = re.compile(
     r"[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}"
 )
-EMAIL_PATTERN = re.compile(rb"[A-Za-z0-9._%+\-]+@[A-Za-z0-9.\-]+\.[A-Za-z]{2,24}")
+# Every quantifier here is bounded, and no two adjacent tokens can match the
+# same character. An earlier version used `[A-Za-z0-9.-]+\.` for the domain —
+# because the class contained a dot, the engine could split a long run of dots
+# and letters in exponentially many ways and would hang for minutes on a blob
+# of binary data that never matched at all.
+EMAIL_PATTERN = re.compile(
+    rb"[A-Za-z0-9._%+\-]{1,64}@(?:[A-Za-z0-9\-]{1,63}\.){1,8}[A-Za-z]{2,24}"
+)
 
 # Addresses that belong to tooling bundled with the app, not to the user.
 EMAIL_NOISE = ("sentry", "example.com", "noreply", "@types", "localhost")
@@ -38,6 +46,15 @@ SCAN_WINDOW = 400
 # files far too large to be a profile record, and scanning them wastes seconds.
 ELECTRON_STORES = ("Local Storage", "IndexedDB", "WebStorage", "Partitions")
 MAX_SCAN_BYTES = 64 * 1024 * 1024
+
+# Compiled-script and asset caches live under these stores but never hold a
+# profile payload, and they are the bulk of the bytes. Skipping them turns a
+# multi-second scan into a fraction of one.
+SKIP_DIRECTORIES = ("Cache", "Code Cache", "GPUCache", "CacheStorage", "ScriptCache", "blob_storage")
+
+# A name on an account is a nicety; a window that never opens is not. If the
+# scan cannot finish in this long, whatever is left falls back to a short UUID.
+SCAN_BUDGET_SECONDS = 5.0
 
 
 @dataclass(frozen=True)
@@ -146,12 +163,17 @@ def _scan_blob(data: bytes) -> dict[str, Identity]:
 
 def _from_electron_stores(app_support: Path) -> dict[str, Identity]:
     found: dict[str, Identity] = {}
+    deadline = time.monotonic() + SCAN_BUDGET_SECONDS
     for store in ELECTRON_STORES:
         base = app_support / store
         if not base.is_dir():
             continue
-        for path in base.rglob("*"):
+        for path in sorted(base.rglob("*")):
+            if time.monotonic() > deadline:
+                return found
             if not path.is_file():
+                continue
+            if any(part in SKIP_DIRECTORIES for part in path.parts):
                 continue
             try:
                 if path.stat().st_size > MAX_SCAN_BYTES:

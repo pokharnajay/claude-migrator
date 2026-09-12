@@ -124,3 +124,41 @@ def test_unreadable_sources_are_skipped_without_raising(tmp_path: Path) -> None:
     (tmp_path / ".claude.json").write_text("{ not json")
     (cli / "backups" / ".claude.json.backup.1").write_bytes(b"\x00\x01\x02")
     assert identity.resolve_identities(tmp_path / "Claude", cli) == {}
+
+
+def test_the_email_pattern_cannot_backtrack_catastrophically() -> None:
+    """A long run of letters and dots that never matches must fail fast.
+
+    The original pattern used a domain class containing a dot followed by a
+    literal dot, which let the engine split such a run in exponentially many
+    ways. It hung for minutes on a 700 KB cache file.
+    """
+    import time
+
+    hostile = (b"a" * 40 + b"." ) * 900 + b"@" + (b"b" * 40 + b".") * 900
+    start = time.monotonic()
+    identity.EMAIL_PATTERN.findall(hostile)
+    assert time.monotonic() - start < 1.0
+
+
+def test_scanning_skips_cache_directories(tmp_path: Path) -> None:
+    """Compiled-script caches hold no profiles and dominate the byte count."""
+    cli = tmp_path / ".claude"
+    cli.mkdir()
+    cache = tmp_path / "Claude" / "Partitions" / "somesite" / "Code Cache" / "js"
+    cache.mkdir(parents=True)
+    (cache / "blob").write_bytes(f'"uuid":"{OLD}","email_address":"cached@example.org"'.encode())
+
+    assert identity.resolve_identities(tmp_path / "Claude", cli) == {}
+
+
+def test_the_scan_gives_up_rather_than_hanging_the_window(tmp_path: Path, monkeypatch) -> None:
+    cli = tmp_path / ".claude"
+    cli.mkdir()
+    store = tmp_path / "Claude" / "Local Storage"
+    store.mkdir(parents=True)
+    for n in range(5):
+        (store / f"b{n}.ldb").write_bytes(b"x" * 1000)
+
+    monkeypatch.setattr(identity, "SCAN_BUDGET_SECONDS", -1.0)  # budget already spent
+    assert identity.resolve_identities(tmp_path / "Claude", cli) == {}
