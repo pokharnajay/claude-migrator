@@ -3,7 +3,8 @@
 Two jobs, one screen:
 
 * Restore on this Mac — back up, then merge a previous account's sessions into
-  the signed-in one.
+  the signed-in one. Step by step with the primary button, or in one go with
+  Merge.
 * Move to another Mac — export a zip here, import it there.
 
 The primary button walks the user through the steps in order and refuses to
@@ -16,6 +17,7 @@ from __future__ import annotations
 import subprocess
 import time
 from dataclasses import dataclass
+from functools import partial
 from datetime import datetime
 from pathlib import Path
 
@@ -277,6 +279,9 @@ class MigratorWindow(QWidget):
         self._on_done: object | None = None
         self._result = None
         self._post_scan_note: str | None = None
+        # Runs once the current job's thread has been released, so it is free to
+        # start another job. Dropped if the job fails.
+        self._then: object | None = None
 
         self.setWindowTitle("Claude Migrator")
         self.setMinimumSize(800, 720)
@@ -405,6 +410,13 @@ class MigratorWindow(QWidget):
         buttons.addWidget(self.status)
         buttons.addStretch(1)
 
+        self.merge_button = QPushButton("Merge")
+        self.merge_button.setToolTip(
+            "Rescan, back up, then merge the ticked accounts into the signed-in one"
+        )
+        self.merge_button.clicked.connect(self._run_merge)
+        buttons.addWidget(self.merge_button)
+
         self.rescan_button = QPushButton("Rescan")
         self.rescan_button.setToolTip("Recount sessions for every account on this Mac")
         self.rescan_button.clicked.connect(self.do_scan)
@@ -529,6 +541,12 @@ class MigratorWindow(QWidget):
     def _apply_scan(self, data) -> None:
         current, accounts, people = data
 
+        # Ticks survive a rescan. Re-ticking an account the user had unticked
+        # would quietly put it back into the next merge.
+        unticked = {
+            (row.account.uuid, row.org.uuid) for row in self.source_rows if not row.selected
+        }
+
         self.scanning_spinner.stop()
         self.scanning_row.hide()
         self.log.clear()
@@ -574,6 +592,8 @@ class MigratorWindow(QWidget):
 
         for account, org, person in sources:
             row = AccountRow(account, org, person)
+            if (account.uuid, org.uuid) in unticked:
+                row.checkbox.setChecked(False)
             self.source_rows.append(row)
             self.sources_box.addWidget(row)
 
@@ -686,23 +706,7 @@ class MigratorWindow(QWidget):
         account = self.scan.target.uuid
 
         def job(progress, log):
-            log("Backing up…")
-            outcome = backup.run_backup_verified(
-                backup.DOWNLOADS, items, progress=progress, current_account=account
-            )
-            self.backup_path = outcome.path
-            self.backup_verified = outcome.verified
-            log(f"Written to {outcome.path}")
-            log()
-            for line in outcome.findings:
-                log("  " + line)
-            log()
-            if not outcome.verified:
-                raise SafetyError(
-                    "Backup could not be verified — refusing to go further. "
-                    "Nothing has been changed."
-                )
-            log("Backup verified.")
+            self._back_up(items, account, progress, log)
             return "Backup verified"
 
         self._start(job, "Backing up…", STEP_SYNC)
@@ -728,36 +732,127 @@ class MigratorWindow(QWidget):
             return
 
         target_uuid = self.scan.target.uuid
-        projects = self.cli_home / "projects"
-        app_support = self.app_support
 
         def job(progress, log):
-            log()
-            log(f"Restoring {plan.session_count} session(s), {human_bytes(plan.total_bytes)}…")
-            result = sync.execute(plan, progress=progress)
-            log(f"Copied           : {result.copied}")
-            log(f"Already present  : {len(plan.already_present) + result.skipped_existing}")
-            if result.archived_merged:
-                log(f"Archive flags    : {result.archived_merged} merged")
-            for path, error in result.failed:
-                log(f"FAILED {path.name}: {error}")
-
-            org = storage.active_org(storage.find_account(app_support, target_uuid))
-            missing = sync.missing_transcripts(org, projects) if org else []
-            if missing:
-                log()
-                log(f"{len(missing)} session(s) will open empty — transcript no longer on disk:")
-                for ref in missing[:12]:
-                    log(f"  · {ref.title}")
-                if len(missing) > 12:
-                    log(f"  … and {len(missing) - 12} more")
-            log()
-            log("Open Claude to see the restored sessions.")
-            if result.failed:
-                raise SafetyError(f"{len(result.failed)} item(s) failed — see above.")
-            return f"Restored {result.copied} item(s)"
+            return f"Restored {self._restore(plan, target_uuid, progress, log)} item(s)"
 
         self._start(job, "Restoring…", STEP_DONE)
+
+    def _back_up(self, items, account: str, progress, log) -> None:
+        """Take a backup and verify it, or raise. Runs in the worker thread."""
+        log("Backing up…")
+        outcome = backup.run_backup_verified(
+            backup.DOWNLOADS, items, progress=progress, current_account=account
+        )
+        self.backup_path = outcome.path
+        self.backup_verified = outcome.verified
+        log(f"Written to {outcome.path}")
+        log()
+        for line in outcome.findings:
+            log("  " + line)
+        log()
+        if not outcome.verified:
+            raise SafetyError(
+                "Backup could not be verified — refusing to go further. "
+                "Nothing has been changed."
+            )
+        log("Backup verified.")
+
+    def _restore(self, plan: sync.SyncPlan, target_uuid: str, progress, log) -> int:
+        """Carry out a sync plan and report on it. Runs in the worker thread.
+
+        Returns how many items were copied; raises if any of them failed.
+        """
+        log()
+        log(f"Restoring {plan.session_count} session(s), {human_bytes(plan.total_bytes)}…")
+        result = sync.execute(plan, progress=progress)
+        log(f"Copied           : {result.copied}")
+        log(f"Already present  : {len(plan.already_present) + result.skipped_existing}")
+        if result.archived_merged:
+            log(f"Archive flags    : {result.archived_merged} merged")
+        for path, error in result.failed:
+            log(f"FAILED {path.name}: {error}")
+
+        org = storage.active_org(storage.find_account(self.app_support, target_uuid))
+        missing = sync.missing_transcripts(org, self.cli_home / "projects") if org else []
+        if missing:
+            log()
+            log(f"{len(missing)} session(s) will open empty — transcript no longer on disk:")
+            for ref in missing[:12]:
+                log(f"  · {ref.title}")
+            if len(missing) > 12:
+                log(f"  … and {len(missing) - 12} more")
+        log()
+        log("Open Claude to see the restored sessions.")
+        if result.failed:
+            raise SafetyError(f"{len(result.failed)} item(s) failed — see above.")
+        return result.copied
+
+    # -- merge in one go ---------------------------------------------------
+
+    def _run_merge(self) -> None:
+        """Rescan, back up, then merge the ticked accounts: all three steps at once.
+
+        The rescan comes first so the merge works from what is on disk now, not
+        from counts taken whenever the window last looked.
+        """
+        if not self._guard():
+            return
+        chosen = {(row.account.uuid, row.org.uuid) for row in self.source_rows if row.selected}
+        self._then = partial(self._merge_scanned, chosen)
+        self.do_scan()
+
+    def _merge_scanned(self, chosen: set[tuple[str, str]]) -> None:
+        """Second half of Merge, once the fresh scan has landed."""
+        if self.scan is None:  # the scan halted, and has already said why
+            return
+        if not self._guard(needs_sources=False):
+            return
+
+        rows = [
+            row
+            for row in self.source_rows
+            if row.selected and (row.account.uuid, row.org.uuid) in chosen
+        ]
+        if not rows:
+            self.say("None of the ticked accounts can be merged from any more. Nothing was merged.")
+            return
+
+        try:
+            plan = sync.plan_sync(
+                self.app_support, self.scan.target, self.scan.target_org, [row.org for row in rows]
+            )
+        except (ValueError, SafetyError) as exc:
+            self.say(str(exc))
+            return
+
+        if not plan.to_copy and not plan.archived_additions:
+            self.say("Nothing to merge — every session is already in this account.")
+            self.status.setText("Nothing to merge")
+            return
+
+        sources = ", ".join(dict.fromkeys(row.who.label for row in rows))
+        confirm = QMessageBox.question(
+            self,
+            "Merge these sessions?",
+            f"From: {sources}\n"
+            f"Into: {self.scan.who.label}\n"
+            f"Sessions: {plan.session_count}   Size: {human_bytes(plan.total_bytes)}\n\n"
+            "A verified backup is taken first. Nothing already in this account is "
+            "overwritten.",
+        )
+        if confirm != QMessageBox.Yes:
+            self.say("Merge cancelled. Nothing was changed.")
+            return
+
+        items = backup.backup_items(self.app_support, self.cli_home, self.transcripts.isChecked())
+        target_uuid = self.scan.target.uuid
+
+        def job(progress, log):
+            self._back_up(items, target_uuid, progress, log)
+            return f"Merged {self._restore(plan, target_uuid, progress, log)} item(s)"
+
+        self._start(job, "Merging…", STEP_DONE)
 
     # -- transfer between Macs ---------------------------------------------
 
@@ -896,9 +991,14 @@ class MigratorWindow(QWidget):
             thread.deleteLater()
         self._set_step(self.step)
 
+        then, self._then = self._then, None
+        if then is not None:
+            then()
+
     def _set_controls_enabled(self, enabled: bool) -> None:
         for widget in (
             self.action_button,
+            self.merge_button,
             self.rescan_button,
             self.export_button,
             self.import_button,
@@ -929,6 +1029,7 @@ class MigratorWindow(QWidget):
             self.reveal_button.show()
 
         if not ok:
+            self._then = None
             self.say(f"Stopped: {message}")
             self.status.setText("Stopped")
             self._set_step(self.step)  # stay where we were; nothing advanced
@@ -955,6 +1056,7 @@ class MigratorWindow(QWidget):
 
         blocked = step == STEP_BLOCKED
         self.export_button.setEnabled(has_sources and not blocked and not self._busy())
+        self.merge_button.setEnabled(has_sources and not blocked and not self._busy())
         self.import_button.setEnabled(self.scan is not None and not blocked and not self._busy())
 
     def _quit_claude(self) -> None:

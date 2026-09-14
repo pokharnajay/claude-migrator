@@ -93,6 +93,10 @@ Claude Migrator copies it into the account you are actually signed in to.
 | **2. Back Up** | Clones your entire Claude footprint to `~/Downloads/claude-backup-<timestamp>/`, then verifies it file-by-file. **Restore stays locked until verification passes.** |
 | **3. Restore Sessions** | Merges the old account's sessions into the signed-in one. |
 
+Or press **Merge** to do all three at once. It rescans, shows what it is about
+to merge and asks you to confirm, takes a verified backup, then merges the ticked
+accounts into the signed-in one. If the backup does not verify, nothing is merged.
+
 Reopen Claude and the conversations are back in the sidebar.
 
 Sessions whose CLI transcript is no longer on disk are listed at the end — they

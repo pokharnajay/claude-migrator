@@ -436,3 +436,171 @@ def test_closing_mid_scan_does_not_destroy_a_running_thread(qt_app, storage_root
     win.closeEvent(QCloseEvent())
     assert win._thread is None or not win._thread.isRunning()
     win.deleteLater()
+
+
+# ------------------------------------------------------------------- merge
+
+
+@pytest.fixture
+def downloads(tmp_path, monkeypatch) -> Path:
+    from claude_migrator import backup as backup_module
+
+    folder = tmp_path / "Downloads"
+    monkeypatch.setattr(backup_module, "DOWNLOADS", folder)
+    return folder
+
+
+@pytest.fixture
+def answer(monkeypatch):
+    """Answer the merge confirmation without a real dialog, and record that it was asked."""
+    from PySide6.QtWidgets import QMessageBox
+
+    asked = {"reply": QMessageBox.Yes, "count": 0}
+
+    def question(*args, **kwargs):
+        asked["count"] += 1
+        return asked["reply"]
+
+    monkeypatch.setattr(app_module.QMessageBox, "question", question)
+    return asked
+
+
+def merged_into_target(storage_root: Path) -> set[str]:
+    from tests.conftest import NEW, NEW_ORG
+
+    return {p.name for p in (storage_root / "claude-code-sessions" / NEW / NEW_ORG).glob("local_*.json")}
+
+
+def merge(qt_app, window) -> None:
+    window.merge_button.click()
+    assert pump(qt_app, lambda: window._thread is None and window._then is None, 30), (
+        "merge never finished"
+    )
+
+
+def test_merge_sits_just_left_of_rescan(window) -> None:
+    layout = window.rescan_button.parentWidget().layout()
+    buttons = layout.itemAt(layout.count() - 1).layout()
+    order = [buttons.itemAt(i).widget() for i in range(buttons.count())]
+    assert order.index(window.merge_button) == order.index(window.rescan_button) - 1
+
+
+def test_merge_is_available_once_scanned(window) -> None:
+    assert window.merge_button.isEnabled()
+
+
+def test_merge_rescans_backs_up_and_merges(qt_app, window, storage_root, downloads, answer) -> None:
+    window.log.clear()
+    merge(qt_app, window)
+
+    text = window.log.toPlainText()
+    assert window.status.text().startswith("Merged"), text
+    assert "Scanned at" in text, "the merge did not rescan first"
+    assert "Backup verified." in text
+    assert answer["count"] == 1
+    assert {"local_old0.json", "local_old1.json", "local_old2.json"} <= merged_into_target(storage_root)
+    assert list(downloads.glob("claude-backup-*"))
+
+
+def test_merge_picks_up_sessions_added_since_the_last_scan(qt_app, window, storage_root, downloads, answer) -> None:
+    from tests.conftest import OLD, OLD_ORG, write_session
+
+    write_session(
+        storage_root / "claude-code-sessions" / OLD / OLD_ORG / "local_late.json",
+        "late", "cli-late", "Written after the window opened",
+    )
+    merge(qt_app, window)
+    assert "local_late.json" in merged_into_target(storage_root), window.log.toPlainText()
+
+
+def test_the_backup_predates_the_merge(qt_app, window, storage_root, downloads, answer) -> None:
+    from tests.conftest import NEW, NEW_ORG
+
+    merge(qt_app, window)
+    (snapshot,) = downloads.glob("claude-backup-*")
+    backed_up = snapshot / "claude-code-sessions" / NEW / NEW_ORG
+    assert {p.name for p in backed_up.glob("local_*.json")} == {"local_current.json"}
+
+
+def test_declining_the_confirmation_changes_nothing(qt_app, window, storage_root, downloads, answer) -> None:
+    from PySide6.QtWidgets import QMessageBox
+
+    answer["reply"] = QMessageBox.No
+    merge(qt_app, window)
+    assert merged_into_target(storage_root) == {"local_current.json"}
+    assert not downloads.exists() or not list(downloads.iterdir())
+    assert "cancelled" in window.log.toPlainText()
+
+
+def test_merge_stops_if_the_backup_does_not_verify(qt_app, window, storage_root, downloads, answer, monkeypatch) -> None:
+    from claude_migrator import backup as backup_module
+
+    def unverified(parent, items, progress=None, current_account=None):
+        return backup_module.BackupResult(path=parent / "claude-backup-x", verified=False, findings=[])
+
+    monkeypatch.setattr(backup_module, "run_backup_verified", unverified)
+    merge(qt_app, window)
+    assert window.status.text() == "Stopped"
+    assert merged_into_target(storage_root) == {"local_current.json"}
+
+
+def test_merging_twice_does_nothing_the_second_time(qt_app, window, storage_root, downloads, answer) -> None:
+    merge(qt_app, window)
+    after_first = merged_into_target(storage_root)
+    backups = len(list(downloads.glob("claude-backup-*")))
+
+    merge(qt_app, window)
+    assert merged_into_target(storage_root) == after_first
+    assert "Nothing to merge" in window.log.toPlainText()
+    assert len(list(downloads.glob("claude-backup-*"))) == backups, "a pointless backup was taken"
+    assert answer["count"] == 1, "asked to confirm a merge that had nothing in it"
+
+
+def test_merge_needs_a_ticked_account(qt_app, window, storage_root, downloads, answer) -> None:
+    for row in window.source_rows:
+        row.checkbox.setChecked(False)
+    window.merge_button.click()
+    assert window._thread is None, "an unticked merge still started a rescan"
+    assert "Select at least one account" in window.log.toPlainText()
+    assert merged_into_target(storage_root) == {"local_current.json"}
+
+
+def test_merge_is_disabled_while_claude_runs(qt_app, storage_root, cli_root, monkeypatch) -> None:
+    monkeypatch.setattr(app_module, "claude_is_running", lambda: True)
+    monkeypatch.setattr(app_module, "SCAN_MINIMUM_SECONDS", 0.0)
+    win = MigratorWindow(storage_root, cli_root)
+    settle(qt_app, win)
+    assert not win.merge_button.isEnabled()
+    win.deleteLater()
+
+
+def test_merge_is_refused_if_claude_starts_during_the_rescan(qt_app, window, storage_root, downloads, answer, monkeypatch) -> None:
+    window.merge_button.click()
+    monkeypatch.setattr(app_module, "claude_is_running", lambda: True)
+    assert pump(qt_app, lambda: window._thread is None and window._then is None, 30)
+    assert answer["count"] == 0
+    assert merged_into_target(storage_root) == {"local_current.json"}
+
+
+def test_rescan_keeps_an_unticked_account_unticked(qt_app, window) -> None:
+    window.source_rows[0].checkbox.setChecked(False)
+    window.do_scan()
+    settle(qt_app, window)
+    assert not window.source_rows[0].selected
+
+
+def test_merge_follows_a_sign_in_that_changed_while_the_window_was_open(
+    qt_app, window, storage_root, downloads, answer
+) -> None:
+    """The rescan is what stops a merge landing in the account you just left."""
+    import json
+
+    from tests.conftest import OLD
+
+    (storage_root / "config.json").write_text(json.dumps({"lastKnownAccountUuid": OLD}))
+    merge(qt_app, window)
+
+    assert window.scan.target.uuid == OLD
+    assert answer["count"] == 0, "offered to merge the now signed-in account into itself"
+    assert merged_into_target(storage_root) == {"local_current.json"}
+    assert "can be merged from any more" in window.log.toPlainText()
